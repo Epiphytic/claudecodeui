@@ -1,3 +1,23 @@
+# [1.1.0](https://github.com/Epiphytic/claudecodeui/compare/v1.0.1...v1.1.0) (2026-01-24)
+
+
+### Bug Fixes
+
+* **server:** add ETag and caching support for static assets ([0c347df](https://github.com/Epiphytic/claudecodeui/commit/0c347df67c29ec1a80eaa9e2821d5b9831c90a4a))
+* **sidebar:** make view selector always visible for independent session view ([0af45c9](https://github.com/Epiphytic/claudecodeui/commit/0af45c9f34c9f6204866b6c4f13ed4b3ee9c0636))
+
+
+### Features
+
+* **components:** projects pane view selector ([5fdcef9](https://github.com/Epiphytic/claudecodeui/commit/5fdcef9e3d8214a3f44a68c9f367f03308f3a5b1))
+* **components:** projects pane view selector ([61b00ae](https://github.com/Epiphytic/claudecodeui/commit/61b00aea9d40b14062424101b77e2e24c700ac40))
+* **projects-pane:** add session view with activity-based filtering ([0374a79](https://github.com/Epiphytic/claudecodeui/commit/0374a79884fd3e14ef3518c8a090cb6e57c4ca4e))
+* **server:** projects pane view selector ([b82bc9f](https://github.com/Epiphytic/claudecodeui/commit/b82bc9f374e7a168303fa47969bc78957a9a1e22))
+* **server:** projects pane view selector ([2ba2494](https://github.com/Epiphytic/claudecodeui/commit/2ba24943b1306758312fe3b6ae38f8e2fc26c44c))
+* **server:** projects pane view selector ([8bbbc69](https://github.com/Epiphytic/claudecodeui/commit/8bbbc697a29dd620597ebae648fe5b463feef85a))
+* **server:** projects pane view selector ([6ab790b](https://github.com/Epiphytic/claudecodeui/commit/6ab790bbe5ec563c2e544c046dda1e5ad3b6e102))
+* **server:** projects pane view selector ([08f00e0](https://github.com/Epiphytic/claudecodeui/commit/08f00e003d92da15696704e0b8a7ddefd8d310d5))
+
 ## [1.0.1](https://github.com/Epiphytic/claudecodeui/compare/v1.0.0...v1.0.1) (2026-01-23)
 
 
