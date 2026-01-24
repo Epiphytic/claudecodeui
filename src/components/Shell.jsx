@@ -10,6 +10,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
+import { SessionStatusBadge } from "./SessionStatusIndicator";
 
 const xtermStyles = `
   .xterm .xterm-screen {
@@ -48,6 +49,8 @@ function Shell({
   const [isRestarting, setIsRestarting] = useState(false);
   const [lastSessionId, setLastSessionId] = useState(null);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [sessionState, setSessionState] = useState(null);
+  const [isDisconnected, setIsDisconnected] = useState(false);
 
   const selectedProjectRef = useRef(selectedProject);
   const selectedSessionRef = useRef(selectedSession);
@@ -158,6 +161,7 @@ function Shell({
       ws.current.onopen = () => {
         setIsConnected(true);
         setIsConnecting(false);
+        setIsDisconnected(false);
 
         setTimeout(() => {
           if (fitAddon.current && terminal.current) {
@@ -214,6 +218,24 @@ function Shell({
             }
           } else if (data.type === "url_open") {
             window.open(data.url, "_blank");
+          } else if (data.type === "session-state-update") {
+            // Update session state (mode, client count, lock status)
+            setSessionState(data.state);
+          } else if (data.type === "conflict-resolved") {
+            // Session conflict was resolved
+            console.log("[Shell] Conflict resolved:", data.action);
+          } else if (data.type === "session-closed") {
+            // Session was closed by server (another client terminated it)
+            console.log("[Shell] Session closed by server");
+            if (terminal.current) {
+              terminal.current.write("\r\n");
+            }
+            setIsConnected(false);
+            setIsConnecting(false);
+            if (ws.current) {
+              ws.current.close();
+              ws.current = null;
+            }
           }
         } catch (error) {
           console.error(
@@ -250,8 +272,12 @@ function Shell({
     connectWebSocket();
   }, [isInitialized, isConnected, isConnecting, connectWebSocket]);
 
-  const disconnectFromShell = useCallback(() => {
+  const disconnectFromShell = useCallback((terminate = false) => {
     if (ws.current) {
+      // If terminate is true, send terminate message to kill the PTY on server
+      if (terminate && ws.current.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: "terminate" }));
+      }
       ws.current.close();
       ws.current = null;
     }
@@ -263,6 +289,7 @@ function Shell({
 
     setIsConnected(false);
     setIsConnecting(false);
+    setIsDisconnected(true);
   }, []);
 
   const sessionDisplayName = useMemo(() => {
@@ -282,7 +309,15 @@ function Shell({
     return sessionDisplayName.slice(0, 50);
   }, [sessionDisplayName]);
 
-  const restartShell = () => {
+  const restartShell = useCallback(() => {
+    // If disconnected, just reconnect to continue the session
+    if (isDisconnected && isInitialized && !isConnecting) {
+      setIsDisconnected(false);
+      connectToShell();
+      return;
+    }
+
+    // Otherwise, do a full restart (dispose terminal and reinitialize)
     setIsRestarting(true);
 
     if (ws.current) {
@@ -298,11 +333,12 @@ function Shell({
 
     setIsConnected(false);
     setIsInitialized(false);
+    setIsDisconnected(false);
 
     setTimeout(() => {
       setIsRestarting(false);
     }, 200);
-  };
+  }, [isDisconnected, isInitialized, isConnecting, connectToShell]);
 
   useEffect(() => {
     const currentSessionId = selectedSession?.id || null;
@@ -502,9 +538,24 @@ function Shell({
   }, [selectedProject?.path || selectedProject?.fullPath, isRestarting]);
 
   useEffect(() => {
-    if (!autoConnect || !isInitialized || isConnecting || isConnected) return;
+    // Don't auto-connect if user explicitly disconnected
+    if (
+      !autoConnect ||
+      !isInitialized ||
+      isConnecting ||
+      isConnected ||
+      isDisconnected
+    )
+      return;
     connectToShell();
-  }, [autoConnect, isInitialized, isConnecting, isConnected, connectToShell]);
+  }, [
+    autoConnect,
+    isInitialized,
+    isConnecting,
+    isConnected,
+    isDisconnected,
+    connectToShell,
+  ]);
 
   if (!selectedProject) {
     return (
@@ -566,13 +617,19 @@ function Shell({
             {isRestarting && (
               <span className="text-xs text-blue-400">(Restarting...)</span>
             )}
+            {sessionState && (
+              <SessionStatusBadge
+                mode={sessionState.mode}
+                clientCount={sessionState.clientCount}
+              />
+            )}
           </div>
           <div className="flex items-center space-x-3">
             {isConnected && (
               <button
-                onClick={disconnectFromShell}
+                onClick={() => disconnectFromShell(true)}
                 className="px-3 py-1 text-xs bg-red-600 text-white rounded hover:bg-red-700 flex items-center space-x-1"
-                title="Disconnect from shell"
+                title="Disconnect and terminate shell session"
               >
                 <svg
                   className="w-3 h-3"
@@ -593,9 +650,17 @@ function Shell({
 
             <button
               onClick={restartShell}
-              disabled={isRestarting || isConnected}
-              className="text-xs text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-1"
-              title="Restart Shell (disconnect first)"
+              disabled={isRestarting || (isConnected && !isDisconnected)}
+              className={`text-xs flex items-center space-x-1 px-3 py-1 rounded transition-colors ${
+                isDisconnected
+                  ? "bg-green-600 text-white hover:bg-green-700 animate-pulse"
+                  : "text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+              }`}
+              title={
+                isDisconnected
+                  ? "Reconnect to shell session"
+                  : "Restart Shell (disconnect first)"
+              }
             >
               <svg
                 className="w-3 h-3"
@@ -610,7 +675,7 @@ function Shell({
                   d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
                 />
               </svg>
-              <span>Restart</span>
+              <span>{isDisconnected ? "Reconnect" : "Restart"}</span>
             </button>
           </div>
         </div>
@@ -629,7 +694,35 @@ function Shell({
           </div>
         )}
 
-        {isInitialized && !isConnected && !isConnecting && (
+        {isInitialized && !isConnected && !isConnecting && isDisconnected && (
+          <div className="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-90 p-4">
+            <div className="text-center max-w-sm w-full">
+              <div className="flex items-center justify-center space-x-3 text-gray-400 mb-4">
+                <svg
+                  className="w-8 h-8"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"
+                  />
+                </svg>
+                <span className="text-lg font-medium">Shell Disconnected</span>
+              </div>
+              <p className="text-gray-500 text-sm">
+                Click the{" "}
+                <span className="text-green-400 font-medium">Reconnect</span>{" "}
+                button above to continue your session
+              </p>
+            </div>
+          </div>
+        )}
+
+        {isInitialized && !isConnected && !isConnecting && !isDisconnected && (
           <div className="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-90 p-4">
             <div className="text-center max-w-sm w-full">
               <button

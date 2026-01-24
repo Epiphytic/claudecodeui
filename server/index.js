@@ -75,6 +75,17 @@ import {
   getActiveClaudeSDKSessions,
   resolveToolApproval,
 } from "./claude-sdk.js";
+import { sessionLock } from "./session-lock.js";
+import {
+  checkTmuxAvailable,
+  createTmuxSession,
+  attachToTmuxSession,
+  killSession as killTmuxSession,
+  generateTmuxSessionName,
+  sessionExists as tmuxSessionExists,
+  resizeSession as resizeTmuxSession,
+} from "./tmux-manager.js";
+import { detectExternalClaude } from "./external-session-detector.js";
 import {
   spawnCursor,
   abortCursorSession,
@@ -100,7 +111,10 @@ import projectsRoutes from "./routes/projects.js";
 import cliAuthRoutes from "./routes/cli-auth.js";
 import userRoutes from "./routes/user.js";
 import codexRoutes from "./routes/codex.js";
-import { initializeDatabase } from "./database/db.js";
+import sessionsRoutes from "./routes/sessions.js";
+import { updateSessionsCache } from "./sessions-cache.js";
+import { updateProjectsCache } from "./projects-cache.js";
+import { initializeDatabase, tmuxSessionsDb } from "./database/db.js";
 import {
   validateApiKey,
   authenticateToken,
@@ -115,6 +129,37 @@ const connectedClients = new Set();
 // Orchestrator integration (initialized in startServer if enabled)
 let orchestrator = null;
 let orchestratorStatusHooks = null;
+
+/**
+ * Clean up stale tmux session entries from the database
+ * Called when projects are rescanned to remove entries for tmux sessions that no longer exist
+ */
+function cleanupStaleTmuxSessions() {
+  try {
+    const allSessions = tmuxSessionsDb.getAllTmuxSessions();
+    const staleIds = [];
+
+    for (const session of allSessions) {
+      // Check if the tmux session still exists
+      if (!tmuxSessionExists(session.tmux_session_name)) {
+        console.log(
+          `🧹 Cleaning up stale tmux entry: ${session.tmux_session_name}`,
+        );
+        staleIds.push(session.id);
+      }
+    }
+
+    if (staleIds.length > 0) {
+      const deleted = tmuxSessionsDb.deleteByIds(staleIds);
+      console.log(`🧹 Cleaned up ${deleted} stale tmux session entries`);
+    }
+  } catch (error) {
+    console.error(
+      "[ERROR] Error cleaning up stale tmux sessions:",
+      error.message,
+    );
+  }
+}
 
 // Setup file system watcher for Claude projects folder using chokidar
 async function setupProjectsWatcher() {
@@ -159,6 +204,13 @@ async function setupProjectsWatcher() {
           // Get updated projects list
           const updatedProjects = await getProjects();
 
+          // Update sessions and projects caches with new projects data
+          updateSessionsCache(updatedProjects);
+          updateProjectsCache(updatedProjects);
+
+          // Clean up stale tmux session entries from database
+          cleanupStaleTmuxSessions();
+
           // Notify all connected clients about the project changes
           const updateMessage = JSON.stringify({
             type: "projects_updated",
@@ -198,8 +250,88 @@ async function setupProjectsWatcher() {
 const app = express();
 const server = http.createServer(app);
 
+/**
+ * PTY Sessions Map - Enhanced for multi-client support
+ *
+ * Each entry: {
+ *   pty: PTYProcess,              // node-pty or tmux attached process
+ *   clients: Set<WebSocket>,      // Connected WebSocket clients
+ *   buffer: string[],             // Output buffer (max 5000 items)
+ *   mode: 'shell' | 'chat',       // Current session mode
+ *   lockedBy: string | null,      // Chat lock holder (clientId)
+ *   tmuxSessionName: string|null, // tmux session name if using tmux
+ *   projectPath: string,
+ *   sessionId: string,
+ *   timeoutId: NodeJS.Timeout|null,
+ *   createdAt: number,
+ *   lastActivity: number,
+ * }
+ */
 const ptySessionsMap = new Map();
 const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
+
+// Check if tmux is available on startup
+const tmuxStatus = checkTmuxAvailable();
+if (tmuxStatus.available) {
+  console.log(`[INFO] tmux available: ${tmuxStatus.version}`);
+} else {
+  console.log(`[WARN] tmux not available: ${tmuxStatus.error}`);
+  console.log("[INFO] Multi-client shell sharing will be limited");
+}
+
+/**
+ * Broadcast a message to all connected clients for a session
+ * @param {string} sessionKey - The session key
+ * @param {object} message - The message object to send
+ */
+function broadcastToSession(sessionKey, message) {
+  const session = ptySessionsMap.get(sessionKey);
+  if (!session || !session.clients) return;
+
+  const messageStr =
+    typeof message === "string" ? message : JSON.stringify(message);
+
+  for (const client of session.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(messageStr);
+      } catch (err) {
+        console.error("[WARN] Failed to send to client:", err.message);
+      }
+    }
+  }
+}
+
+/**
+ * Broadcast session state update to all clients
+ * @param {string} sessionKey - The session key
+ */
+function broadcastSessionState(sessionKey) {
+  const session = ptySessionsMap.get(sessionKey);
+  if (!session) return;
+
+  broadcastToSession(sessionKey, {
+    type: "session-state-update",
+    sessionKey,
+    state: {
+      mode: session.mode || "shell",
+      clientCount: session.clients ? session.clients.size : 0,
+      lockedBy: session.lockedBy,
+      tmuxSessionName: session.tmuxSessionName,
+    },
+  });
+}
+
+/**
+ * Get the session key for a project/session combination
+ * @param {string} projectPath
+ * @param {string} sessionId
+ * @param {string} commandSuffix - Optional command suffix for unique commands
+ * @returns {string}
+ */
+function getPtySessionKey(projectPath, sessionId, commandSuffix = "") {
+  return `${projectPath}_${sessionId || "default"}${commandSuffix}`;
+}
 
 // Single WebSocket server that handles both paths
 const wss = new WebSocketServer({
@@ -309,16 +441,42 @@ app.use("/api/user", authenticateToken, userRoutes);
 // Codex API Routes (protected)
 app.use("/api/codex", authenticateToken, codexRoutes);
 
+// Sessions API Routes (protected)
+app.use("/api/sessions", authenticateToken, sessionsRoutes);
+
 // Agent API Routes (uses API key authentication)
 app.use("/api/agent", agentRoutes);
 
-// Serve public files (like api-docs.html)
-app.use(express.static(path.join(__dirname, "../public")));
+// Serve public files (like api-docs.html, icons)
+// Enable ETag generation for conditional requests (304 support)
+app.use(
+  express.static(path.join(__dirname, "../public"), {
+    etag: true,
+    lastModified: true,
+    setHeaders: (res, filePath) => {
+      // Cache icons and other static assets
+      if (filePath.match(/\.(svg|png|jpg|jpeg|gif|ico|woff2?|ttf|eot)$/)) {
+        // Cache for 1 week, allow revalidation
+        res.setHeader(
+          "Cache-Control",
+          "public, max-age=604800, must-revalidate",
+        );
+      } else if (filePath.endsWith(".html")) {
+        // HTML files should not be cached
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+      }
+    },
+  }),
+);
 
 // Static files served after API routes
 // Add cache control: HTML files should not be cached, but assets can be cached
 app.use(
   express.static(path.join(__dirname, "../dist"), {
+    etag: true,
+    lastModified: true,
     setHeaders: (res, filePath) => {
       if (filePath.endsWith(".html")) {
         // Prevent HTML caching to avoid service worker issues after builds
@@ -517,6 +675,75 @@ app.delete(
     }
   },
 );
+
+// Terminate shell session endpoint (for conflict resolution from chat interface)
+app.post("/api/shell/terminate", authenticateToken, async (req, res) => {
+  try {
+    const { projectPath, sessionId } = req.body;
+
+    if (!projectPath) {
+      return res.status(400).json({ error: "projectPath is required" });
+    }
+
+    // Build session key (same format as in handleShellConnection)
+    const sessionKey = sessionId
+      ? `${projectPath}:${sessionId}`
+      : `${projectPath}:plain-shell`;
+
+    console.log("🔪 API: Force closing shell session:", sessionKey);
+
+    const session = ptySessionsMap.get(sessionKey);
+
+    if (!session) {
+      // Session not found - might already be closed
+      return res.json({
+        success: true,
+        message: "Session not found or already closed",
+      });
+    }
+
+    // Notify all shell clients
+    const closeMsg = JSON.stringify({
+      type: "output",
+      data: `\r\n\x1b[31m[Session terminated by another client]\x1b[0m\r\n`,
+    });
+
+    for (const client of session.clients) {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(closeMsg);
+          // Also send a session-closed message so clients know to disconnect
+          client.send(JSON.stringify({ type: "session-closed" }));
+        } catch {
+          // Ignore send errors
+        }
+      }
+    }
+
+    // Kill the PTY process
+    if (session.pty && session.pty.kill) {
+      session.pty.kill();
+    }
+
+    // Kill tmux session if exists
+    if (session.tmuxSessionName) {
+      killTmuxSession(session.tmuxSessionName);
+    }
+
+    // Clear any pending timeout
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+    }
+
+    ptySessionsMap.delete(sessionKey);
+
+    console.log("✅ Shell session terminated:", sessionKey);
+    res.json({ success: true, sessionKey });
+  } catch (error) {
+    console.error("[API] Error terminating shell session:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Create project endpoint
 app.post("/api/projects/create", authenticateToken, async (req, res) => {
@@ -904,6 +1131,81 @@ async function handleChatMessage(ws, writer, messageData) {
       console.log("📁 Project:", data.options?.projectPath || "Unknown");
       console.log("🔄 Session:", data.options?.sessionId ? "Resume" : "New");
 
+      const projectPath = data.options?.projectPath;
+      const sessionId = data.options?.sessionId || sessionIdForTracking;
+      const ptySessionKey = getPtySessionKey(projectPath, sessionId);
+
+      // Check for active shell session with clients
+      const shellSession = ptySessionsMap.get(ptySessionKey);
+      if (
+        shellSession &&
+        shellSession.clients &&
+        shellSession.clients.size > 0
+      ) {
+        // Shell is active with connected clients
+        writer.send({
+          type: "session-conflict",
+          sessionKey: ptySessionKey,
+          conflictType: "shell-active",
+          message: "A shell session is active with connected clients",
+          clientCount: shellSession.clients.size,
+          options: ["close-shell", "fork-session", "cancel"],
+        });
+        return;
+      }
+
+      // Check for external Claude sessions
+      if (projectPath) {
+        const externalCheck = detectExternalClaude(projectPath);
+        if (externalCheck.hasExternalSession) {
+          writer.send({
+            type: "external-session-detected",
+            projectPath,
+            details: {
+              processIds: externalCheck.processes.map((p) => p.pid),
+              tmuxSessions: externalCheck.tmuxSessions.map(
+                (s) => s.sessionName,
+              ),
+              lockFile: externalCheck.lockFile.exists
+                ? externalCheck.lockFile.lockFile
+                : null,
+            },
+          });
+          // Continue with warning - don't block the chat
+        }
+      }
+
+      // Acquire chat lock
+      const clientId = `chat-${Date.now()}`;
+      const lockResult = sessionLock.acquireLock(
+        ptySessionKey,
+        clientId,
+        "chat",
+        {
+          sessionId,
+          startedAt: Date.now(),
+        },
+      );
+
+      if (!lockResult.success) {
+        writer.send({
+          type: "session-conflict",
+          sessionKey: ptySessionKey,
+          conflictType: "chat-locked",
+          message: lockResult.reason,
+          holder: lockResult.holder,
+          options: ["wait", "cancel"],
+        });
+        return;
+      }
+
+      // Update shell session mode if it exists
+      if (shellSession) {
+        shellSession.mode = "chat";
+        shellSession.lockedBy = clientId;
+        broadcastSessionState(ptySessionKey);
+      }
+
       // Track busy status for orchestrator
       if (orchestratorStatusHooks) {
         orchestratorStatusHooks.onQueryStart(sessionIdForTracking);
@@ -913,6 +1215,16 @@ async function handleChatMessage(ws, writer, messageData) {
         // Use Claude Agents SDK
         await queryClaudeSDK(data.command, data.options, writer);
       } finally {
+        // Release chat lock
+        sessionLock.releaseLock(ptySessionKey, clientId);
+
+        // Reset shell session mode
+        if (shellSession) {
+          shellSession.mode = "shell";
+          shellSession.lockedBy = null;
+          broadcastSessionState(ptySessionKey);
+        }
+
         // Mark as no longer busy
         if (orchestratorStatusHooks) {
           orchestratorStatusHooks.onQueryEnd(sessionIdForTracking);
@@ -1054,12 +1366,14 @@ async function handleChatMessage(ws, writer, messageData) {
   }
 }
 
-// Handle shell WebSocket connections
+// Handle shell WebSocket connections with multi-client support
 function handleShellConnection(ws) {
   console.log("🐚 Shell client connected");
+
+  // Generate unique client ID for this connection
+  const clientId = `shell-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   let shellProcess = null;
   let ptySessionKey = null;
-  let outputBuffer = [];
 
   ws.on("message", async (message) => {
     try {
@@ -1089,7 +1403,7 @@ function handleShellConnection(ws) {
           isPlainShell && initialCommand
             ? `_cmd_${Buffer.from(initialCommand).toString("base64").slice(0, 16)}`
             : "";
-        ptySessionKey = `${projectPath}_${sessionId || "default"}${commandSuffix}`;
+        ptySessionKey = getPtySessionKey(projectPath, sessionId, commandSuffix);
 
         // Kill any existing login session before starting fresh
         if (isLoginCommand) {
@@ -1101,6 +1415,10 @@ function handleShellConnection(ws) {
             );
             if (oldSession.timeoutId) clearTimeout(oldSession.timeoutId);
             if (oldSession.pty && oldSession.pty.kill) oldSession.pty.kill();
+            // Kill tmux session if exists
+            if (oldSession.tmuxSessionName) {
+              killTmuxSession(oldSession.tmuxSessionName);
+            }
             ptySessionsMap.delete(ptySessionKey);
           }
         }
@@ -1108,25 +1426,133 @@ function handleShellConnection(ws) {
         const existingSession = isLoginCommand
           ? null
           : ptySessionsMap.get(ptySessionKey);
+
+        // Check for saved tmux session in database (for server restarts)
+        if (!existingSession && !isLoginCommand && !isPlainShell) {
+          const savedTmuxName = tmuxSessionsDb.getTmuxSession(
+            projectPath,
+            sessionId,
+          );
+          if (savedTmuxName && tmuxSessionExists(savedTmuxName)) {
+            console.log(
+              "♻️  Found existing tmux session from database:",
+              savedTmuxName,
+            );
+
+            // Reconnect to the existing tmux session
+            const termCols = data.cols || 80;
+            const termRows = data.rows || 24;
+
+            const attachResult = attachToTmuxSession(savedTmuxName, pty, {
+              cols: termCols,
+              rows: termRows,
+            });
+
+            if (attachResult && attachResult.pty) {
+              shellProcess = attachResult.pty;
+
+              // Update last used timestamp
+              tmuxSessionsDb.touchTmuxSession(projectPath, sessionId);
+
+              // Create session with multi-client support
+              const clients = new Set([ws]);
+              ptySessionsMap.set(ptySessionKey, {
+                pty: shellProcess,
+                clients,
+                buffer: [],
+                mode: "shell",
+                lockedBy: null,
+                tmuxSessionName: savedTmuxName,
+                timeoutId: null,
+                projectPath,
+                sessionId,
+                createdAt: Date.now(),
+                lastActivity: Date.now(),
+              });
+
+              // Handle data output - broadcast to all clients
+              shellProcess.onData((outputData) => {
+                const session = ptySessionsMap.get(ptySessionKey);
+                if (!session) return;
+                session.lastActivity = Date.now();
+
+                // Add to buffer
+                if (session.buffer.length < 5000) {
+                  session.buffer.push(outputData);
+                } else {
+                  session.buffer.shift();
+                  session.buffer.push(outputData);
+                }
+
+                // Broadcast to all clients
+                broadcastToSession(ptySessionKey, {
+                  type: "output",
+                  data: outputData,
+                });
+              });
+
+              shellProcess.onExit(({ exitCode }) => {
+                console.log(`🔴 Tmux process exited with code ${exitCode}`);
+                const session = ptySessionsMap.get(ptySessionKey);
+                if (session) {
+                  broadcastToSession(ptySessionKey, {
+                    type: "output",
+                    data: `\r\n\x1b[33mSession ended with exit code ${exitCode}\x1b[0m\r\n`,
+                  });
+                  ptySessionsMap.delete(ptySessionKey);
+                }
+              });
+
+              ws.send(
+                JSON.stringify({
+                  type: "output",
+                  data: `\x1b[36m[Reconnected to existing tmux session]\x1b[0m\r\n`,
+                }),
+              );
+
+              broadcastSessionState(ptySessionKey);
+              return;
+            } else {
+              // Failed to attach, will create new session below
+              console.log(
+                "⚠️  Failed to attach to saved tmux session, creating new one",
+              );
+              // Clean up stale database entry
+              tmuxSessionsDb.deleteTmuxSession(projectPath, sessionId);
+            }
+          }
+        }
+
         if (existingSession) {
+          // Multi-client: Add this client to the existing session
           console.log(
-            "♻️  Reconnecting to existing PTY session:",
+            "♻️  Adding client to existing PTY session:",
             ptySessionKey,
           );
           shellProcess = existingSession.pty;
 
-          clearTimeout(existingSession.timeoutId);
+          // Clear timeout since we have an active client
+          if (existingSession.timeoutId) {
+            clearTimeout(existingSession.timeoutId);
+            existingSession.timeoutId = null;
+          }
 
+          // Add client to the clients Set
+          existingSession.clients.add(ws);
+          existingSession.lastActivity = Date.now();
+
+          // Send reconnect message to this client only
           ws.send(
             JSON.stringify({
               type: "output",
-              data: `\x1b[36m[Reconnected to existing session]\x1b[0m\r\n`,
+              data: `\x1b[36m[Connected to session - ${existingSession.clients.size} client(s) connected]\x1b[0m\r\n`,
             }),
           );
 
+          // Send buffered output to this new client
           if (existingSession.buffer && existingSession.buffer.length > 0) {
             console.log(
-              `📜 Sending ${existingSession.buffer.length} buffered messages`,
+              `📜 Sending ${existingSession.buffer.length} buffered messages to new client`,
             );
             existingSession.buffer.forEach((bufferedData) => {
               ws.send(
@@ -1138,7 +1564,22 @@ function handleShellConnection(ws) {
             });
           }
 
-          existingSession.ws = ws;
+          // Send session state to this client
+          ws.send(
+            JSON.stringify({
+              type: "session-state-update",
+              sessionKey: ptySessionKey,
+              state: {
+                mode: existingSession.mode || "shell",
+                clientCount: existingSession.clients.size,
+                lockedBy: existingSession.lockedBy,
+                tmuxSessionName: existingSession.tmuxSessionName,
+              },
+            }),
+          );
+
+          // Broadcast updated client count to all clients
+          broadcastSessionState(ptySessionKey);
 
           return;
         }
@@ -1221,114 +1662,201 @@ function handleShellConnection(ws) {
 
           console.log("🔧 Executing shell command:", shellCommand);
 
-          // Use appropriate shell based on platform
-          const shell = os.platform() === "win32" ? "powershell.exe" : "bash";
-          const shellArgs =
-            os.platform() === "win32"
-              ? ["-Command", shellCommand]
-              : ["-c", shellCommand];
-
           // Use terminal dimensions from client if provided, otherwise use defaults
           const termCols = data.cols || 80;
           const termRows = data.rows || 24;
           console.log("📐 Using terminal dimensions:", termCols, "x", termRows);
 
-          shellProcess = pty.spawn(shell, shellArgs, {
-            name: "xterm-256color",
-            cols: termCols,
-            rows: termRows,
-            cwd: os.homedir(),
-            env: {
-              ...process.env,
-              TERM: "xterm-256color",
-              COLORTERM: "truecolor",
-              FORCE_COLOR: "3",
-              // Override browser opening commands to echo URL for detection
-              BROWSER:
-                os.platform() === "win32"
-                  ? 'echo "OPEN_URL:"'
-                  : 'echo "OPEN_URL:"',
-            },
-          });
+          // Track tmux session name if we use tmux
+          let tmuxSessionName = null;
+
+          // For non-plain-shell sessions on Unix, use tmux for session persistence
+          const useTmux =
+            !isPlainShell &&
+            os.platform() !== "win32" &&
+            checkTmuxAvailable().available;
+
+          if (useTmux) {
+            // Create tmux session
+            const tmuxResult = createTmuxSession(
+              projectPath,
+              sessionId || "shell",
+              {
+                cols: termCols,
+                rows: termRows,
+              },
+            );
+
+            if (tmuxResult.success) {
+              tmuxSessionName = tmuxResult.tmuxSessionName;
+              console.log("📺 Created/found tmux session:", tmuxSessionName);
+
+              // Save to database for persistence across server restarts
+              tmuxSessionsDb.saveTmuxSession(
+                projectPath,
+                sessionId,
+                tmuxSessionName,
+              );
+
+              // Send the shell command to tmux
+              const { spawnSync } = await import("child_process");
+              spawnSync(
+                "tmux",
+                ["send-keys", "-t", tmuxSessionName, shellCommand, "Enter"],
+                {
+                  encoding: "utf8",
+                },
+              );
+
+              // Attach to tmux session
+              const attachResult = attachToTmuxSession(tmuxSessionName, pty, {
+                cols: termCols,
+                rows: termRows,
+              });
+
+              if (attachResult && attachResult.pty) {
+                shellProcess = attachResult.pty;
+              } else {
+                // Fallback to direct PTY if tmux attach fails
+                console.log(
+                  "⚠️  Tmux attach failed, falling back to direct PTY",
+                );
+                tmuxSessionName = null;
+              }
+            }
+          }
+
+          // Fallback to direct PTY spawn (for plain shell, Windows, or tmux failure)
+          if (!shellProcess) {
+            const shell = os.platform() === "win32" ? "powershell.exe" : "bash";
+            const shellArgs =
+              os.platform() === "win32"
+                ? ["-Command", shellCommand]
+                : ["-c", shellCommand];
+
+            shellProcess = pty.spawn(shell, shellArgs, {
+              name: "xterm-256color",
+              cols: termCols,
+              rows: termRows,
+              cwd: os.homedir(),
+              env: {
+                ...process.env,
+                TERM: "xterm-256color",
+                COLORTERM: "truecolor",
+                FORCE_COLOR: "3",
+                // Override browser opening commands to echo URL for detection
+                BROWSER:
+                  os.platform() === "win32"
+                    ? 'echo "OPEN_URL:"'
+                    : 'echo "OPEN_URL:"',
+              },
+            });
+          }
 
           console.log(
             "🟢 Shell process started with PTY, PID:",
             shellProcess.pid,
+            tmuxSessionName ? `(tmux: ${tmuxSessionName})` : "(direct)",
           );
 
+          // Create session with multi-client support
+          const clients = new Set([ws]);
           ptySessionsMap.set(ptySessionKey, {
             pty: shellProcess,
-            ws: ws,
+            clients,
             buffer: [],
+            mode: "shell",
+            lockedBy: null,
+            tmuxSessionName,
             timeoutId: null,
             projectPath,
             sessionId,
+            createdAt: Date.now(),
+            lastActivity: Date.now(),
           });
 
-          // Handle data output
-          shellProcess.onData((data) => {
+          // Handle data output - broadcast to all clients
+          shellProcess.onData((outputData) => {
             const session = ptySessionsMap.get(ptySessionKey);
             if (!session) return;
 
+            session.lastActivity = Date.now();
+
+            // Add to buffer (circular buffer, max 5000 items)
             if (session.buffer.length < 5000) {
-              session.buffer.push(data);
+              session.buffer.push(outputData);
             } else {
               session.buffer.shift();
-              session.buffer.push(data);
+              session.buffer.push(outputData);
             }
 
-            if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-              let outputData = data;
+            // Process output for URL detection
+            let processedData = outputData;
 
-              // Check for various URL opening patterns
-              const patterns = [
-                // Direct browser opening commands
-                /(?:xdg-open|open|start)\s+(https?:\/\/[^\s\x1b\x07]+)/g,
-                // BROWSER environment variable override
-                /OPEN_URL:\s*(https?:\/\/[^\s\x1b\x07]+)/g,
-                // Git and other tools opening URLs
-                /Opening\s+(https?:\/\/[^\s\x1b\x07]+)/gi,
-                // General URL patterns that might be opened
-                /Visit:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
-                /View at:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
-                /Browse to:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
-              ];
+            // Check for various URL opening patterns
+            const patterns = [
+              // Direct browser opening commands
+              /(?:xdg-open|open|start)\s+(https?:\/\/[^\s\x1b\x07]+)/g,
+              // BROWSER environment variable override
+              /OPEN_URL:\s*(https?:\/\/[^\s\x1b\x07]+)/g,
+              // Git and other tools opening URLs
+              /Opening\s+(https?:\/\/[^\s\x1b\x07]+)/gi,
+              // General URL patterns that might be opened
+              /Visit:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
+              /View at:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
+              /Browse to:\s*(https?:\/\/[^\s\x1b\x07]+)/gi,
+            ];
 
-              patterns.forEach((pattern) => {
-                let match;
-                while ((match = pattern.exec(data)) !== null) {
-                  const url = match[1];
-                  console.log("[DEBUG] Detected URL for opening:", url);
+            const detectedUrls = [];
+            patterns.forEach((pattern) => {
+              let match;
+              while ((match = pattern.exec(outputData)) !== null) {
+                const url = match[1];
+                console.log("[DEBUG] Detected URL for opening:", url);
+                detectedUrls.push(url);
 
-                  // Send URL opening message to client
-                  session.ws.send(
-                    JSON.stringify({
-                      type: "url_open",
-                      url: url,
-                    }),
+                // Replace the OPEN_URL pattern with a user-friendly message
+                if (pattern.source.includes("OPEN_URL")) {
+                  processedData = processedData.replace(
+                    match[0],
+                    `[INFO] Opening in browser: ${url}`,
                   );
+                }
+              }
+            });
 
-                  // Replace the OPEN_URL pattern with a user-friendly message
-                  if (pattern.source.includes("OPEN_URL")) {
-                    outputData = outputData.replace(
-                      match[0],
-                      `[INFO] Opening in browser: ${url}`,
+            // Broadcast output to all clients
+            for (const client of session.clients) {
+              if (client.readyState === WebSocket.OPEN) {
+                try {
+                  // Send URL opening message
+                  for (const url of detectedUrls) {
+                    client.send(
+                      JSON.stringify({
+                        type: "url_open",
+                        url,
+                      }),
                     );
                   }
-                }
-              });
 
-              // Send regular output
-              session.ws.send(
-                JSON.stringify({
-                  type: "output",
-                  data: outputData,
-                }),
-              );
+                  // Send regular output
+                  client.send(
+                    JSON.stringify({
+                      type: "output",
+                      data: processedData,
+                    }),
+                  );
+                } catch (err) {
+                  console.error(
+                    "[WARN] Failed to send to client:",
+                    err.message,
+                  );
+                }
+              }
             }
           });
 
-          // Handle process exit
+          // Handle process exit - broadcast to all clients
           shellProcess.onExit((exitCode) => {
             console.log(
               "🔚 Shell process exited with code:",
@@ -1337,21 +1865,34 @@ function handleShellConnection(ws) {
               exitCode.signal,
             );
             const session = ptySessionsMap.get(ptySessionKey);
-            if (
-              session &&
-              session.ws &&
-              session.ws.readyState === WebSocket.OPEN
-            ) {
-              session.ws.send(
-                JSON.stringify({
-                  type: "output",
-                  data: `\r\n\x1b[33mProcess exited with code ${exitCode.exitCode}${exitCode.signal ? ` (${exitCode.signal})` : ""}\x1b[0m\r\n`,
-                }),
-              );
+
+            if (session) {
+              // Broadcast exit to all clients
+              const exitMsg = JSON.stringify({
+                type: "output",
+                data: `\r\n\x1b[33mProcess exited with code ${exitCode.exitCode}${exitCode.signal ? ` (${exitCode.signal})` : ""}\x1b[0m\r\n`,
+              });
+
+              for (const client of session.clients) {
+                if (client.readyState === WebSocket.OPEN) {
+                  try {
+                    client.send(exitMsg);
+                  } catch {
+                    // Ignore send errors during exit
+                  }
+                }
+              }
+
+              if (session.timeoutId) {
+                clearTimeout(session.timeoutId);
+              }
+
+              // Kill tmux session if it exists
+              if (session.tmuxSessionName) {
+                killTmuxSession(session.tmuxSessionName);
+              }
             }
-            if (session && session.timeoutId) {
-              clearTimeout(session.timeoutId);
-            }
+
             ptySessionsMap.delete(ptySessionKey);
             shellProcess = null;
           });
@@ -1366,9 +1907,25 @@ function handleShellConnection(ws) {
         }
       } else if (data.type === "input") {
         // Send input to shell process
+        const session = ptySessionsMap.get(ptySessionKey);
+
+        // Check if session is locked by chat
+        if (session && session.mode === "chat") {
+          ws.send(
+            JSON.stringify({
+              type: "output",
+              data: `\r\n\x1b[33m[Chat in progress - shell input disabled]\x1b[0m\r\n`,
+            }),
+          );
+          return;
+        }
+
         if (shellProcess && shellProcess.write) {
           try {
             shellProcess.write(data.data);
+            if (session) {
+              session.lastActivity = Date.now();
+            }
           } catch (error) {
             console.error("Error writing to shell:", error);
           }
@@ -1380,7 +1937,121 @@ function handleShellConnection(ws) {
         if (shellProcess && shellProcess.resize) {
           console.log("Terminal resize requested:", data.cols, "x", data.rows);
           shellProcess.resize(data.cols, data.rows);
+
+          // Also resize tmux session if using tmux
+          const session = ptySessionsMap.get(ptySessionKey);
+          if (session && session.tmuxSessionName) {
+            resizeTmuxSession(session.tmuxSessionName, data.cols, data.rows);
+          }
         }
+      } else if (data.type === "check-session-mode") {
+        // Return current session mode
+        const session = ptySessionsMap.get(data.sessionKey || ptySessionKey);
+        ws.send(
+          JSON.stringify({
+            type: "session-state-update",
+            sessionKey: data.sessionKey || ptySessionKey,
+            state: session
+              ? {
+                  mode: session.mode || "shell",
+                  clientCount: session.clients ? session.clients.size : 0,
+                  lockedBy: session.lockedBy,
+                  tmuxSessionName: session.tmuxSessionName,
+                }
+              : null,
+          }),
+        );
+      } else if (data.type === "terminate") {
+        // Handle client request to terminate their session
+        const session = ptySessionsMap.get(ptySessionKey);
+        if (session) {
+          console.log(
+            "🔪 Client requested session termination:",
+            ptySessionKey,
+          );
+
+          // Notify all shell clients
+          const closeMsg = JSON.stringify({
+            type: "output",
+            data: `\r\n\x1b[33m[Session terminated]\x1b[0m\r\n`,
+          });
+
+          for (const client of session.clients) {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(closeMsg);
+                client.send(JSON.stringify({ type: "session-closed" }));
+              } catch {
+                // Ignore
+              }
+            }
+          }
+
+          // Kill the PTY process
+          if (session.pty && session.pty.kill) {
+            session.pty.kill();
+          }
+
+          // Kill tmux session if exists
+          if (session.tmuxSessionName) {
+            killTmuxSession(session.tmuxSessionName);
+          }
+
+          // Clear any pending timeout
+          if (session.timeoutId) {
+            clearTimeout(session.timeoutId);
+          }
+
+          ptySessionsMap.delete(ptySessionKey);
+          console.log("✅ Shell session terminated by client:", ptySessionKey);
+        }
+      } else if (data.type === "resolve-conflict") {
+        // Handle conflict resolution
+        const targetSessionKey = data.sessionKey || ptySessionKey;
+        const session = ptySessionsMap.get(targetSessionKey);
+
+        if (data.action === "close-shell" && session) {
+          // Kill the shell session
+          console.log("🔪 Force closing shell session:", targetSessionKey);
+
+          // Notify all shell clients
+          const closeMsg = JSON.stringify({
+            type: "output",
+            data: `\r\n\x1b[31m[Session closed by another client]\x1b[0m\r\n`,
+          });
+
+          for (const client of session.clients) {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(closeMsg);
+              } catch {
+                // Ignore
+              }
+            }
+          }
+
+          // Kill the PTY process
+          if (session.pty && session.pty.kill) {
+            session.pty.kill();
+          }
+
+          // Kill tmux session if exists
+          if (session.tmuxSessionName) {
+            killTmuxSession(session.tmuxSessionName);
+          }
+
+          ptySessionsMap.delete(targetSessionKey);
+
+          // Confirm to the requesting client
+          ws.send(
+            JSON.stringify({
+              type: "conflict-resolved",
+              action: "close-shell",
+              sessionKey: targetSessionKey,
+            }),
+          );
+        }
+        // Note: 'fork-session' is handled by the frontend creating a new session
       }
     } catch (error) {
       console.error("[ERROR] Shell WebSocket error:", error.message);
@@ -1396,27 +2067,42 @@ function handleShellConnection(ws) {
   });
 
   ws.on("close", () => {
-    console.log("🔌 Shell client disconnected");
+    console.log("🔌 Shell client disconnected:", clientId);
 
     if (ptySessionKey) {
       const session = ptySessionsMap.get(ptySessionKey);
-      if (session) {
-        console.log(
-          "⏳ PTY session kept alive, will timeout in 30 minutes:",
-          ptySessionKey,
-        );
-        session.ws = null;
+      if (session && session.clients) {
+        // Remove this client from the session
+        session.clients.delete(ws);
 
-        session.timeoutId = setTimeout(() => {
+        console.log(
+          `📊 Session ${ptySessionKey}: ${session.clients.size} client(s) remaining`,
+        );
+
+        // Broadcast updated client count to remaining clients
+        if (session.clients.size > 0) {
+          broadcastSessionState(ptySessionKey);
+        } else {
+          // No clients left, start timeout
           console.log(
-            "⏰ PTY session timeout, killing process:",
+            "⏳ PTY session kept alive, will timeout in 30 minutes:",
             ptySessionKey,
           );
-          if (session.pty && session.pty.kill) {
-            session.pty.kill();
-          }
-          ptySessionsMap.delete(ptySessionKey);
-        }, PTY_SESSION_TIMEOUT);
+
+          session.timeoutId = setTimeout(() => {
+            console.log(
+              "⏰ PTY session timeout, killing process:",
+              ptySessionKey,
+            );
+            if (session.pty && session.pty.kill) {
+              session.pty.kill();
+            }
+            if (session.tmuxSessionName) {
+              killTmuxSession(session.tmuxSessionName);
+            }
+            ptySessionsMap.delete(ptySessionKey);
+          }, PTY_SESSION_TIMEOUT);
+        }
       }
     }
   });
@@ -2110,6 +2796,26 @@ async function startServer() {
 
       // Start watching the projects folder for changes
       await setupProjectsWatcher();
+
+      // Initialize sessions and projects caches with initial project data
+      try {
+        const initialProjects = await getProjects();
+        updateSessionsCache(initialProjects);
+        updateProjectsCache(initialProjects);
+        console.log(
+          `${c.ok("[OK]")} Sessions cache initialized with ${initialProjects.length} projects`,
+        );
+        console.log(
+          `${c.ok("[OK]")} Projects cache initialized with ${initialProjects.length} projects`,
+        );
+
+        // Clean up stale tmux session entries on startup
+        cleanupStaleTmuxSessions();
+      } catch (cacheError) {
+        console.warn(
+          `${c.warn("[WARN]")} Failed to initialize caches: ${cacheError.message}`,
+        );
+      }
     });
   } catch (error) {
     console.error("[ERROR] Failed to start server:", error);
