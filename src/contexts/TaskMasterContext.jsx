@@ -1,41 +1,47 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import { api } from '../utils/api';
-import { useAuth } from './AuthContext';
-import { useWebSocketContext } from './WebSocketContext';
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+} from "react";
+import { api } from "../utils/api";
+import { useAuth } from "./AuthContext";
+import { useWebSocketContext } from "./WebSocketContext";
 
 const TaskMasterContext = createContext({
   // TaskMaster project state
   projects: [],
   currentProject: null,
   projectTaskMaster: null,
-  
+
   // MCP server state
   mcpServerStatus: null,
-  
+
   // Tasks state
   tasks: [],
   nextTask: null,
-  
+
   // Loading states
   isLoading: false,
   isLoadingTasks: false,
   isLoadingMCP: false,
-  
+
   // Error state
   error: null,
-  
+
   // Actions
   refreshProjects: () => {},
   setCurrentProject: () => {},
   refreshTasks: () => {},
   refreshMCPStatus: () => {},
-  clearError: () => {}
+  clearError: () => {},
 });
 
 export const useTaskMaster = () => {
   const context = useContext(TaskMasterContext);
   if (!context) {
-    throw new Error('useTaskMaster must be used within a TaskMasterProvider');
+    throw new Error("useTaskMaster must be used within a TaskMasterProvider");
   }
   return context;
 };
@@ -43,10 +49,10 @@ export const useTaskMaster = () => {
 export const TaskMasterProvider = ({ children }) => {
   // Get WebSocket messages from shared context to avoid duplicate connections
   const { messages } = useWebSocketContext();
-  
+
   // Authentication context
   const { user, token, isLoading: authLoading } = useAuth();
-  
+
   // State
   const [projects, setProjects] = useState([]);
   const [currentProject, setCurrentProjectState] = useState(null);
@@ -65,7 +71,7 @@ export const TaskMasterProvider = ({ children }) => {
     setError({
       message: error.message || `Failed to ${context}`,
       context,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   };
 
@@ -88,42 +94,44 @@ export const TaskMasterProvider = ({ children }) => {
     try {
       setIsLoading(true);
       clearError();
-      const response = await api.get('/projects');
-      
+      const response = await api.get("/projects");
+
       if (!response.ok) {
         throw new Error(`Failed to fetch projects: ${response.status}`);
       }
-      
+
       const projectsData = await response.json();
-      
+
       // Check if projectsData is an array
       if (!Array.isArray(projectsData)) {
-        console.error('Projects API returned non-array data:', projectsData);
+        console.error("Projects API returned non-array data:", projectsData);
         setProjects([]);
         return;
       }
-      
+
       // Filter and enrich projects with TaskMaster data
-      const enrichedProjects = projectsData.map(project => ({
+      const enrichedProjects = projectsData.map((project) => ({
         ...project,
         taskMasterConfigured: project.taskmaster?.hasTaskmaster || false,
-        taskMasterStatus: project.taskmaster?.status || 'not-configured',
+        taskMasterStatus: project.taskmaster?.status || "not-configured",
         taskCount: project.taskmaster?.metadata?.taskCount || 0,
-        completedCount: project.taskmaster?.metadata?.completed || 0
+        completedCount: project.taskmaster?.metadata?.completed || 0,
       }));
-      
+
       setProjects(enrichedProjects);
-      
+
       // If current project is set, update its TaskMaster data
       if (currentProject) {
-        const updatedCurrent = enrichedProjects.find(p => p.name === currentProject.name);
+        const updatedCurrent = enrichedProjects.find(
+          (p) => p.name === currentProject.name,
+        );
         if (updatedCurrent) {
           setCurrentProjectState(updatedCurrent);
           setProjectTaskMaster(updatedCurrent.taskmaster);
         }
       }
     } catch (err) {
-      handleError(err, 'load projects');
+      handleError(err, "load projects");
     } finally {
       setIsLoading(false);
     }
@@ -139,8 +147,8 @@ export const TaskMasterProvider = ({ children }) => {
 
       setProjectTaskMaster(project?.taskmaster || null);
     } catch (err) {
-      console.error('Error in setCurrentProject:', err);
-      handleError(err, 'set current project');
+      console.error("Error in setCurrentProject:", err);
+      handleError(err, "set current project");
       setProjectTaskMaster(project?.taskmaster || null);
     }
   }, []);
@@ -156,10 +164,10 @@ export const TaskMasterProvider = ({ children }) => {
     try {
       setIsLoadingMCP(true);
       clearError();
-      const mcpStatus = await api.get('/mcp-utils/taskmaster-server');
+      const mcpStatus = await api.get("/mcp-utils/taskmaster-server");
       setMCPServerStatus(mcpStatus);
     } catch (err) {
-      handleError(err, 'check MCP server status');
+      handleError(err, "check MCP server status");
     } finally {
       setIsLoadingMCP(false);
     }
@@ -183,29 +191,30 @@ export const TaskMasterProvider = ({ children }) => {
     try {
       setIsLoadingTasks(true);
       clearError();
-      
+
       // Load tasks from the TaskMaster API endpoint
-      const response = await api.get(`/taskmaster/tasks/${encodeURIComponent(currentProject.name)}`);
-      
+      const response = await api.get(
+        `/taskmaster/tasks/${encodeURIComponent(currentProject.name)}`,
+      );
+
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.message || 'Failed to load tasks');
+        throw new Error(errorData.message || "Failed to load tasks");
       }
-      
+
       const data = await response.json();
-      
+
       setTasks(data.tasks || []);
-      
+
       // Find next task (pending or in-progress)
-      const nextTask = data.tasks?.find(task => 
-        task.status === 'pending' || task.status === 'in-progress'
-      ) || null;
+      const nextTask =
+        data.tasks?.find(
+          (task) => task.status === "pending" || task.status === "in-progress",
+        ) || null;
       setNextTask(nextTask);
-      
-      
     } catch (err) {
-      console.error('Error loading tasks:', err);
-      handleError(err, 'load tasks');
+      console.error("Error loading tasks:", err);
+      handleError(err, "load tasks");
       // Set empty state on error
       setTasks([]);
       setNextTask(null);
@@ -214,15 +223,13 @@ export const TaskMasterProvider = ({ children }) => {
     }
   }, [currentProject, user, token]);
 
-  // Load initial data on mount or when auth changes
+  // Load initial MCP status on mount or when auth changes
+  // NOTE: Projects are loaded by App.jsx, not here, to avoid duplicate API calls
   useEffect(() => {
     if (!authLoading && user && token) {
-      refreshProjects();
       refreshMCPStatus();
-    } else {
-      console.log('Auth not ready or no user, skipping project load:', { authLoading, user: !!user, token: !!token });
     }
-  }, [refreshProjects, refreshMCPStatus, authLoading, user, token]);
+  }, [refreshMCPStatus, authLoading, user, token]);
 
   // Clear errors when authentication changes
   useEffect(() => {
@@ -243,32 +250,37 @@ export const TaskMasterProvider = ({ children }) => {
     const latestMessage = messages[messages.length - 1];
     if (!latestMessage) return;
 
-
     switch (latestMessage.type) {
-      case 'taskmaster-project-updated':
+      case "taskmaster-project-updated":
         // Refresh projects when TaskMaster state changes
         if (latestMessage.projectName) {
           refreshProjects();
         }
         break;
-        
-      case 'taskmaster-tasks-updated':
+
+      case "taskmaster-tasks-updated":
         // Refresh tasks for the current project
         if (latestMessage.projectName === currentProject?.name) {
           refreshTasks();
         }
         break;
-        
-      case 'taskmaster-mcp-status-changed':
+
+      case "taskmaster-mcp-status-changed":
         // Refresh MCP server status
         refreshMCPStatus();
         break;
-        
+
       default:
         // Ignore non-TaskMaster messages
         break;
     }
-  }, [messages, refreshProjects, refreshTasks, refreshMCPStatus, currentProject]);
+  }, [
+    messages,
+    refreshProjects,
+    refreshTasks,
+    refreshMCPStatus,
+    currentProject,
+  ]);
 
   // Context value
   const contextValue = {
@@ -283,13 +295,13 @@ export const TaskMasterProvider = ({ children }) => {
     isLoadingTasks,
     isLoadingMCP,
     error,
-    
+
     // Actions
     refreshProjects,
     setCurrentProject,
     refreshTasks,
     refreshMCPStatus,
-    clearError
+    clearError,
   };
 
   return (
