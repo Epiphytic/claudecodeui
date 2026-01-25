@@ -13,6 +13,7 @@ import {
   generateETag,
   getCacheMeta,
   isCacheInitialized,
+  waitForInitialization,
   TIMEFRAME_MS,
 } from "../sessions-cache.js";
 
@@ -31,14 +32,18 @@ const router = express.Router();
  * - 304 Not Modified (if ETag matches)
  * - 200 OK with sessions data
  */
-router.get("/list", (req, res) => {
+router.get("/list", async (req, res) => {
   try {
-    // Check if cache is initialized
+    // Wait for cache to be initialized (blocks until ready or timeout)
     if (!isCacheInitialized()) {
-      return res.status(503).json({
-        error: "Sessions cache not yet initialized",
-        message: "Please wait for initial project scan to complete",
-      });
+      try {
+        await waitForInitialization();
+      } catch (err) {
+        return res.status(503).json({
+          error: "Sessions cache initialization timeout",
+          message: err.message,
+        });
+      }
     }
 
     // Get timeframe from query (validate against known values)

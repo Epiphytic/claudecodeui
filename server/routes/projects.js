@@ -9,6 +9,7 @@ import {
   generateETag,
   getCacheMeta,
   isCacheInitialized,
+  waitForInitialization,
   TIMEFRAME_MS,
 } from "../projects-cache.js";
 
@@ -26,14 +27,18 @@ const router = express.Router();
  * Headers:
  * - If-None-Match: ETag from previous response (for 304 support)
  */
-router.get("/list", (req, res) => {
+router.get("/list", async (req, res) => {
   try {
-    // Check if cache is initialized
+    // Wait for cache to be initialized (blocks until ready or timeout)
     if (!isCacheInitialized()) {
-      return res.status(503).json({
-        error: "Projects cache not yet initialized",
-        message: "Please wait for initial project scan to complete",
-      });
+      try {
+        await waitForInitialization();
+      } catch (err) {
+        return res.status(503).json({
+          error: "Projects cache initialization timeout",
+          message: err.message,
+        });
+      }
     }
 
     // Get timeframe from query (validate against known values)

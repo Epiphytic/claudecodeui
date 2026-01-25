@@ -14,6 +14,10 @@ let cachedProjects = [];
 let cacheVersion = 0;
 let cacheTimestamp = null;
 
+// Promise-based initialization waiting
+let initResolvers = [];
+const MAX_WAIT_MS = 30000; // 30 second timeout
+
 /**
  * Timeframe definitions in milliseconds
  * (Same as sessions-cache.js for consistency)
@@ -109,6 +113,14 @@ function updateProjectsCache(projects) {
 
   cacheVersion++;
   cacheTimestamp = new Date().toISOString();
+
+  // Resolve any waiting promises
+  if (initResolvers.length > 0) {
+    for (const resolve of initResolvers) {
+      resolve();
+    }
+    initResolvers = [];
+  }
 }
 
 /**
@@ -171,6 +183,35 @@ function isCacheInitialized() {
 }
 
 /**
+ * Wait for cache to be initialized
+ * Returns immediately if already initialized, otherwise waits up to MAX_WAIT_MS
+ */
+function waitForInitialization() {
+  if (cacheTimestamp !== null) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      // Remove this resolver from the list
+      const idx = initResolvers.indexOf(resolve);
+      if (idx !== -1) {
+        initResolvers.splice(idx, 1);
+      }
+      reject(new Error("Cache initialization timeout"));
+    }, MAX_WAIT_MS);
+
+    // Wrap resolver to clear timeout
+    const wrappedResolve = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+
+    initResolvers.push(wrappedResolve);
+  });
+}
+
+/**
  * Get the raw cached projects (for initial load)
  */
 function getCachedProjects() {
@@ -190,6 +231,7 @@ export {
   generateETag,
   getCacheMeta,
   isCacheInitialized,
+  waitForInitialization,
   getCachedProjects,
   getProjectFromCache,
   TIMEFRAME_MS,
