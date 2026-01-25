@@ -1,7 +1,7 @@
 // Service Worker for Claude Code UI PWA
 // Supports both direct access and orchestrator proxy access via proxyBase parameter
 
-const CACHE_NAME = "claude-ui-v2";
+const CACHE_NAME = "claude-ui-v3";
 
 // Extract proxyBase from the service worker URL query string
 // e.g., sw.js?proxyBase=/clients/badal-laptop/proxy
@@ -9,7 +9,21 @@ const swUrl = new URL(self.location.href);
 const proxyBase = swUrl.searchParams.get("proxyBase") || "";
 
 // URLs to cache (root-relative, without proxyBase)
-const urlsToCache = ["/", "/index.html", "/manifest.json"];
+const urlsToCache = [
+  "/",
+  "/index.html",
+  "/manifest.json",
+  "/favicon.svg",
+  "/favicon.png",
+  "/icons/claude-ai-icon.svg",
+  "/icons/cursor.svg",
+  "/icons/cursor-white.svg",
+  "/icons/codex.svg",
+  "/icons/codex-white.svg",
+  "/icons/icon-152x152.png",
+  "/icons/icon-192x192.png",
+  "/icons/icon-512x512.png",
+];
 
 // Normalize a URL by removing the proxyBase prefix if present
 // This allows us to use consistent cache keys regardless of access path
@@ -56,6 +70,11 @@ self.addEventListener("install", (event) => {
   self.skipWaiting();
 });
 
+// Check if URL is a static asset that should use cache-first strategy
+function isStaticAsset(url) {
+  return /\.(svg|png|jpg|jpeg|gif|ico|woff2?|ttf|eot|css|js)(\?.*)?$/.test(url);
+}
+
 // Fetch event
 self.addEventListener("fetch", (event) => {
   event.respondWith(
@@ -69,7 +88,10 @@ self.addEventListener("fetch", (event) => {
         normalizedUrl === "manifest.json"
       ) {
         try {
-          const networkResponse = await fetch(request);
+          // Use cache: 'no-cache' to get fresh content but still respect ETag
+          const networkResponse = await fetch(request.url, {
+            cache: "no-cache",
+          });
           // Only cache successful responses
           if (networkResponse.ok) {
             const cache = await caches.open(CACHE_NAME);
@@ -109,7 +131,25 @@ self.addEventListener("fetch", (event) => {
         return response;
       }
 
-      // Otherwise fetch from network
+      // For static assets, fetch with cache mode 'default' to use browser caching
+      // and cache the response in the service worker for offline use
+      if (isStaticAsset(normalizedUrl)) {
+        try {
+          // Use cache: 'default' to leverage browser HTTP caching
+          const networkResponse = await fetch(request.url, {
+            cache: "default",
+          });
+          if (networkResponse.ok) {
+            cache.put(request, networkResponse.clone());
+          }
+          return networkResponse;
+        } catch {
+          // If fetch fails and we have no cached response, throw
+          throw new Error(`Failed to fetch static asset: ${normalizedUrl}`);
+        }
+      }
+
+      // For other requests, just fetch from network
       return fetch(request);
     })(),
   );
