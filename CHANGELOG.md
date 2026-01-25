@@ -1,3 +1,11 @@
+## [1.2.1](https://github.com/Epiphytic/claudecodeui/compare/v1.2.0...v1.2.1) (2026-01-25)
+
+
+### Bug Fixes
+
+* bump service worker cache version and use network-first for manifest.json ([ae81d43](https://github.com/Epiphytic/claudecodeui/commit/ae81d43f4b4be0c2767b6b2bc34c458f590ce17a))
+* multiple UI and stability improvements ([d80dede](https://github.com/Epiphytic/claudecodeui/commit/d80dede96b6ea649cab72a55ea3c90cd7096cb4a))
+
 # [1.2.0](https://github.com/Epiphytic/claudecodeui/compare/v1.1.0...v1.2.0) (2026-01-25)
 
 
