@@ -62,6 +62,7 @@ function AppContent() {
   const [isMobile, setIsMobile] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
+  const [isProjectSwitching, setIsProjectSwitching] = useState(false);
   const [isInputFocused, setIsInputFocused] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState("agents");
@@ -429,6 +430,10 @@ function AppContent() {
   }, [sessionId, projects, navigate]);
 
   const handleProjectSelect = (project) => {
+    // Don't show loading if selecting the same project
+    if (project?.name !== selectedProject?.name) {
+      setIsProjectSwitching(true);
+    }
     setSelectedProject(project);
     setSelectedSession(null);
     navigate("/");
@@ -1049,6 +1054,8 @@ function AppContent() {
           isPWA={isPWA}
           onMenuClick={() => setSidebarOpen(true)}
           isLoading={isLoadingProjects}
+          isProjectSwitching={isProjectSwitching}
+          onProjectReady={() => setIsProjectSwitching(false)}
           onInputFocusChange={setIsInputFocused}
           onSessionActive={markSessionAsActive}
           onSessionInactive={markSessionAsInactive}
