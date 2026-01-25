@@ -575,13 +575,9 @@ app.use(
     etag: true,
     lastModified: true,
     setHeaders: (res, filePath) => {
-      // Cache icons and other static assets
+      // Cache icons and other static assets for 1 hour
       if (filePath.match(/\.(svg|png|jpg|jpeg|gif|ico|woff2?|ttf|eot)$/)) {
-        // Cache for 1 week, allow revalidation
-        res.setHeader(
-          "Cache-Control",
-          "public, max-age=604800, must-revalidate",
-        );
+        res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
       } else if (filePath.endsWith(".json")) {
         // JSON files (like manifest.json) - short cache with revalidation
         res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");

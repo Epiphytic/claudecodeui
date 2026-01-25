@@ -2811,8 +2811,10 @@ function ChatInterface({
   const messageListCacheRef = useRef(null); // { messages: [], total: number, etag: string }
   const messageBodiesCacheRef = useRef(new Map()); // Map<number, message>
   const lastKnownMessageNumberRef = useRef(0);
+  const messageListLastFetchedRef = useRef(0); // Timestamp of last list fetch
   const messagePollingRef = useRef(null); // Polling timer reference
   const MESSAGE_POLL_INTERVAL = 10000; // 10 seconds between polls
+  const MESSAGE_LIST_BACKUP_INTERVAL = 5 * 60 * 1000; // 5 minutes - only refresh list as backup
   // Streaming throttle buffers
   const streamBufferRef = useRef("");
   const streamTimerRef = useRef(null);
@@ -3377,7 +3379,33 @@ function ChatInterface({
         }
 
         // For Claude, use efficient caching strategy
-        // Step 1: Get the message list (cached for 60s)
+        // Messages are immutable - only fetch list as backup every 5 minutes
+        const now = Date.now();
+        const timeSinceLastListFetch = now - messageListLastFetchedRef.current;
+        const hasValidCache =
+          messageListCacheRef.current &&
+          lastKnownMessageNumberRef.current > 0 &&
+          messageBodiesCacheRef.current.size > 0;
+
+        // Skip list fetch if we have valid cache and it's within the backup interval
+        // Initial load (isInitialLoad=true) should always fetch
+        if (
+          hasValidCache &&
+          !isInitialLoad &&
+          timeSinceLastListFetch < MESSAGE_LIST_BACKUP_INTERVAL
+        ) {
+          // Return cached messages without hitting the server
+          const cached = messageBodiesCacheRef.current;
+          const messages = [];
+          for (let i = 1; i <= lastKnownMessageNumberRef.current; i++) {
+            if (cached.has(i)) {
+              messages.push(cached.get(i));
+            }
+          }
+          return messages;
+        }
+
+        // Step 1: Get the message list (only on initial load or every 5 minutes as backup)
         const listResponse = await api.messagesList(
           projectName,
           sessionId,
@@ -3386,6 +3414,7 @@ function ChatInterface({
 
         if (listResponse.status === 304) {
           // List hasn't changed, return cached messages
+          messageListLastFetchedRef.current = now;
           const cached = messageBodiesCacheRef.current;
           const messages = [];
           for (let i = 1; i <= lastKnownMessageNumberRef.current; i++) {
@@ -3403,12 +3432,13 @@ function ChatInterface({
         const listData = await listResponse.json();
         const etag = listResponse.headers.get("etag");
 
-        // Update cache
+        // Update cache and timestamp
         messageListCacheRef.current = {
           messages: listData.messages,
           total: listData.total,
           etag,
         };
+        messageListLastFetchedRef.current = now;
 
         setTotalMessages(listData.total);
         setHasMoreMessages(false); // Using new system, no pagination
@@ -3473,66 +3503,64 @@ function ChatInterface({
   );
 
   // Poll for new messages when chat is active
-  const pollForNewMessages = useCallback(
-    async (projectName, sessionId) => {
-      if (!projectName || !sessionId) return;
+  // Messages are immutable - just append new ones without re-fetching the list
+  const pollForNewMessages = useCallback(async (projectName, sessionId) => {
+    if (!projectName || !sessionId) return;
 
-      const nextNumber = lastKnownMessageNumberRef.current + 1;
+    const nextNumber = lastKnownMessageNumberRef.current + 1;
+    const newMessages = [];
 
-      try {
-        const response = await api.messageByNumber(
-          projectName,
-          sessionId,
-          nextNumber,
-        );
+    try {
+      const response = await api.messageByNumber(
+        projectName,
+        sessionId,
+        nextNumber,
+      );
 
-        if (response.ok) {
-          // New message found! Fetch it and any subsequent messages
-          const data = await response.json();
-          messageBodiesCacheRef.current.set(data.number, data.message);
+      if (response.ok) {
+        // New message found! Fetch it and any subsequent messages
+        const data = await response.json();
+        messageBodiesCacheRef.current.set(data.number, data.message);
+        newMessages.push(data.message);
 
-          // Keep fetching until we get a 404
-          let currentNumber = nextNumber + 1;
-          let hasMore = true;
+        // Keep fetching until we get a 404
+        let currentNumber = nextNumber + 1;
+        let hasMore = true;
 
-          while (hasMore) {
-            const nextResponse = await api.messageByNumber(
-              projectName,
-              sessionId,
-              currentNumber,
-            );
-
-            if (nextResponse.ok) {
-              const nextData = await nextResponse.json();
-              messageBodiesCacheRef.current.set(
-                nextData.number,
-                nextData.message,
-              );
-              currentNumber++;
-            } else {
-              hasMore = false;
-            }
-          }
-
-          // Update last known number
-          lastKnownMessageNumberRef.current = currentNumber - 1;
-
-          // Reload session messages to update UI
-          const messages = await loadSessionMessages(
+        while (hasMore) {
+          const nextResponse = await api.messageByNumber(
             projectName,
             sessionId,
-            false,
-            "claude",
+            currentNumber,
           );
-          setSessionMessages(messages);
+
+          if (nextResponse.ok) {
+            const nextData = await nextResponse.json();
+            messageBodiesCacheRef.current.set(
+              nextData.number,
+              nextData.message,
+            );
+            newMessages.push(nextData.message);
+            currentNumber++;
+          } else {
+            hasMore = false;
+          }
         }
-        // If 404, no new messages - poll again after interval
-      } catch (error) {
-        console.error("Error polling for new messages:", error);
+
+        // Update last known number
+        lastKnownMessageNumberRef.current = currentNumber - 1;
+
+        // Append new messages directly to state (messages are immutable, no need to re-fetch list)
+        if (newMessages.length > 0) {
+          setSessionMessages((prev) => [...prev, ...newMessages]);
+          setTotalMessages((prev) => prev + newMessages.length);
+        }
       }
-    },
-    [loadSessionMessages],
-  );
+      // If 404, no new messages - poll again after interval
+    } catch (error) {
+      console.error("Error polling for new messages:", error);
+    }
+  }, []);
 
   // Load Cursor session messages from SQLite via backend
   const loadCursorSessionMessages = useCallback(
@@ -4233,6 +4261,7 @@ function ChatInterface({
           messageListCacheRef.current = null;
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
+          messageListLastFetchedRef.current = 0;
           // Clear polling timer
           if (messagePollingRef.current) {
             clearInterval(messagePollingRef.current);
@@ -4262,6 +4291,7 @@ function ChatInterface({
           messageListCacheRef.current = null;
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
+          messageListLastFetchedRef.current = 0;
 
           // Check if the session is currently processing on the backend
           if (ws && sendMessage) {
@@ -4342,6 +4372,7 @@ function ChatInterface({
         messageListCacheRef.current = null;
         messageBodiesCacheRef.current = new Map();
         lastKnownMessageNumberRef.current = 0;
+        messageListLastFetchedRef.current = 0;
         // Clear polling timer
         if (messagePollingRef.current) {
           clearInterval(messagePollingRef.current);
