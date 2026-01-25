@@ -2835,6 +2835,10 @@ function ChatInterface({
   const [listPollInterval, setListPollInterval] = useState(LIST_POLL_INITIAL);
   const messagePollIntervalRef = useRef(MESSAGE_POLL_INITIAL);
   const listPollIntervalRef = useRef(LIST_POLL_INITIAL);
+
+  // Polling coordination - prevent simultaneous requests
+  const isMessagePollingRef = useRef(false);
+  const isListPollingRef = useRef(false);
   // Streaming throttle buffers
   const streamBufferRef = useRef("");
   const streamTimerRef = useRef(null);
@@ -3523,6 +3527,7 @@ function ChatInterface({
   );
 
   // Reset polling intervals to initial values
+  // The next scheduled poll will use the new (reset) interval from the ref
   const resetPollingIntervals = useCallback(() => {
     messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
     listPollIntervalRef.current = LIST_POLL_INITIAL;
@@ -3556,6 +3561,12 @@ function ChatInterface({
   const pollForNewMessages = useCallback(
     async (projectName, sessionId) => {
       if (!projectName || !sessionId) return false;
+
+      // Prevent simultaneous polls - skip if any polling is in progress
+      if (isMessagePollingRef.current || isListPollingRef.current) {
+        return false;
+      }
+      isMessagePollingRef.current = true;
 
       const nextNumber = lastKnownMessageNumberRef.current + 1;
       const newMessages = [];
@@ -3606,14 +3617,17 @@ function ChatInterface({
             setTotalMessages((prev) => prev + newMessages.length);
             // Reset polling intervals when new messages found
             resetPollingIntervals();
+            isMessagePollingRef.current = false;
             return true;
           }
         }
         // If 404, no new messages - increase backoff
         increaseMessagePollInterval();
+        isMessagePollingRef.current = false;
         return false;
       } catch (error) {
         console.error("Error polling for new messages:", error);
+        isMessagePollingRef.current = false;
         // On error, also increase backoff
         increaseMessagePollInterval();
         return false;
@@ -4322,11 +4336,13 @@ function ChatInterface({
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
           messageListLastFetchedRef.current = 0;
-          // Reset polling intervals to initial values
+          // Reset polling intervals and locks
           messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
           listPollIntervalRef.current = LIST_POLL_INITIAL;
           setMessagePollInterval(MESSAGE_POLL_INITIAL);
           setListPollInterval(LIST_POLL_INITIAL);
+          isMessagePollingRef.current = false;
+          isListPollingRef.current = false;
           // Clear polling timers
           if (messagePollingRef.current) {
             clearTimeout(messagePollingRef.current);
@@ -4361,11 +4377,13 @@ function ChatInterface({
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
           messageListLastFetchedRef.current = 0;
-          // Reset polling intervals to initial values
+          // Reset polling intervals and locks
           messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
           listPollIntervalRef.current = LIST_POLL_INITIAL;
           setMessagePollInterval(MESSAGE_POLL_INITIAL);
           setListPollInterval(LIST_POLL_INITIAL);
+          isMessagePollingRef.current = false;
+          isListPollingRef.current = false;
 
           // Check if the session is currently processing on the backend
           if (ws && sendMessage) {
@@ -4447,11 +4465,13 @@ function ChatInterface({
         messageBodiesCacheRef.current = new Map();
         lastKnownMessageNumberRef.current = 0;
         messageListLastFetchedRef.current = 0;
-        // Reset polling intervals to initial values
+        // Reset polling intervals and locks
         messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
         listPollIntervalRef.current = LIST_POLL_INITIAL;
         setMessagePollInterval(MESSAGE_POLL_INITIAL);
         setListPollInterval(LIST_POLL_INITIAL);
+        isMessagePollingRef.current = false;
+        isListPollingRef.current = false;
         // Clear polling timers
         if (messagePollingRef.current) {
           clearTimeout(messagePollingRef.current);
@@ -4590,6 +4610,14 @@ function ChatInterface({
     ) {
       const scheduleListPoll = () => {
         listPollingRef.current = setTimeout(async () => {
+          // Skip if message polling is in progress or list polling already running
+          if (isMessagePollingRef.current || isListPollingRef.current) {
+            scheduleListPoll();
+            return;
+          }
+
+          isListPollingRef.current = true;
+
           // Fetch the messages list as backup
           try {
             const listResponse = await api.messagesList(
@@ -4605,8 +4633,12 @@ function ChatInterface({
               // Check if we have new messages
               const currentCount = lastKnownMessageNumberRef.current;
               if (listData.total > currentCount) {
-                // New messages! Fetch them
+                // New messages! Fetch only missing ones from cache
                 for (let i = currentCount + 1; i <= listData.total; i++) {
+                  // Skip if already in cache
+                  if (messageBodiesCacheRef.current.has(i)) {
+                    continue;
+                  }
                   const msgResponse = await api.messageByNumber(
                     selectedProject.name,
                     selectedSession.id,
@@ -4633,6 +4665,7 @@ function ChatInterface({
                 setTotalMessages(listData.total);
 
                 // Reset intervals on new messages
+                isListPollingRef.current = false;
                 resetPollingIntervals();
               } else {
                 // No new messages, increase backoff
@@ -4646,7 +4679,10 @@ function ChatInterface({
                 etag,
               };
               messageListLastFetchedRef.current = Date.now();
-            } else if (listResponse.status !== 304) {
+            } else if (listResponse.status === 304) {
+              // No changes, increase backoff
+              increaseListPollInterval();
+            } else {
               // Error (not 304), increase backoff
               increaseListPollInterval();
             }
@@ -4654,6 +4690,8 @@ function ChatInterface({
             console.error("Error in list backup poll:", error);
             increaseListPollInterval();
           }
+
+          isListPollingRef.current = false;
 
           // Schedule next poll
           scheduleListPoll();
