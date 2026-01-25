@@ -2807,6 +2807,12 @@ function ChatInterface({
   const isLoadingMoreRef = useRef(false);
   const topLoadLockRef = useRef(false);
   const pendingScrollRestoreRef = useRef(null);
+  // Efficient message caching
+  const messageListCacheRef = useRef(null); // { messages: [], total: number, etag: string }
+  const messageBodiesCacheRef = useRef(new Map()); // Map<number, message>
+  const lastKnownMessageNumberRef = useRef(0);
+  const messagePollingRef = useRef(null); // Polling timer reference
+  const MESSAGE_POLL_INTERVAL = 10000; // 10 seconds between polls
   // Streaming throttle buffers
   const streamBufferRef = useRef("");
   const streamTimerRef = useRef(null);
@@ -3327,7 +3333,7 @@ function ChatInterface({
     };
   }, []);
 
-  // Load session messages from API with pagination
+  // Load session messages from API using efficient caching strategy
   const loadSessionMessages = useCallback(
     async (projectName, sessionId, loadMore = false, provider = "claude") => {
       if (!projectName || !sessionId) return [];
@@ -3340,37 +3346,120 @@ function ChatInterface({
       }
 
       try {
-        const currentOffset = loadMore ? messagesOffset : 0;
-        const response = await api.sessionMessages(
+        // For non-Claude providers, use the old endpoint
+        if (provider !== "claude") {
+          const currentOffset = loadMore ? messagesOffset : 0;
+          const response = await api.sessionMessages(
+            projectName,
+            sessionId,
+            MESSAGES_PER_PAGE,
+            currentOffset,
+            provider,
+          );
+          if (!response.ok) {
+            throw new Error("Failed to load session messages");
+          }
+          const data = await response.json();
+
+          if (isInitialLoad && data.tokenUsage) {
+            setTokenBudget(data.tokenUsage);
+          }
+
+          if (data.hasMore !== undefined) {
+            setHasMoreMessages(data.hasMore);
+            setTotalMessages(data.total);
+            setMessagesOffset(currentOffset + (data.messages?.length || 0));
+            return data.messages || [];
+          } else {
+            const messages = data.messages || [];
+            setHasMoreMessages(false);
+            setTotalMessages(messages.length);
+            return messages;
+          }
+        }
+
+        // For Claude, use efficient caching strategy
+        // Step 1: Get the message list (cached for 60s)
+        const listResponse = await api.messagesList(
           projectName,
           sessionId,
-          MESSAGES_PER_PAGE,
-          currentOffset,
-          provider,
+          messageListCacheRef.current?.etag,
         );
-        if (!response.ok) {
-          throw new Error("Failed to load session messages");
-        }
-        const data = await response.json();
 
-        // Extract token usage if present (Codex includes it in messages response)
-        if (isInitialLoad && data.tokenUsage) {
-          setTokenBudget(data.tokenUsage);
-        }
-
-        // Handle paginated response
-        if (data.hasMore !== undefined) {
-          setHasMoreMessages(data.hasMore);
-          setTotalMessages(data.total);
-          setMessagesOffset(currentOffset + (data.messages?.length || 0));
-          return data.messages || [];
-        } else {
-          // Backward compatibility for non-paginated response
-          const messages = data.messages || [];
-          setHasMoreMessages(false);
-          setTotalMessages(messages.length);
+        if (listResponse.status === 304) {
+          // List hasn't changed, return cached messages
+          const cached = messageBodiesCacheRef.current;
+          const messages = [];
+          for (let i = 1; i <= lastKnownMessageNumberRef.current; i++) {
+            if (cached.has(i)) {
+              messages.push(cached.get(i));
+            }
+          }
           return messages;
         }
+
+        if (!listResponse.ok) {
+          throw new Error("Failed to load message list");
+        }
+
+        const listData = await listResponse.json();
+        const etag = listResponse.headers.get("etag");
+
+        // Update cache
+        messageListCacheRef.current = {
+          messages: listData.messages,
+          total: listData.total,
+          etag,
+        };
+
+        setTotalMessages(listData.total);
+        setHasMoreMessages(false); // Using new system, no pagination
+
+        // Step 2: Determine which messages to fetch
+        const messageNumbers = listData.messages.map((m) => m.number);
+        const cachedBodies = messageBodiesCacheRef.current;
+        const missingNumbers = messageNumbers.filter(
+          (n) => !cachedBodies.has(n),
+        );
+
+        // Step 3: Fetch missing messages (use range for efficiency)
+        if (missingNumbers.length > 0) {
+          const minMissing = Math.min(...missingNumbers);
+          const maxMissing = Math.max(...missingNumbers);
+
+          // Batch fetch in chunks of 100
+          for (let start = minMissing; start <= maxMissing; start += 100) {
+            const end = Math.min(start + 99, maxMissing);
+            const rangeResponse = await api.messagesByRange(
+              projectName,
+              sessionId,
+              start,
+              end,
+            );
+
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                cachedBodies.set(msg.number, msg);
+              }
+            }
+          }
+        }
+
+        // Update last known message number
+        if (messageNumbers.length > 0) {
+          lastKnownMessageNumberRef.current = Math.max(...messageNumbers);
+        }
+
+        // Build ordered message array from cache
+        const messages = [];
+        for (const m of listData.messages) {
+          if (cachedBodies.has(m.number)) {
+            messages.push(cachedBodies.get(m.number));
+          }
+        }
+
+        return messages;
       } catch (error) {
         console.error("Error loading session messages:", error);
         return [];
@@ -3383,6 +3472,68 @@ function ChatInterface({
       }
     },
     [messagesOffset],
+  );
+
+  // Poll for new messages when chat is active
+  const pollForNewMessages = useCallback(
+    async (projectName, sessionId) => {
+      if (!projectName || !sessionId) return;
+
+      const nextNumber = lastKnownMessageNumberRef.current + 1;
+
+      try {
+        const response = await api.messageByNumber(
+          projectName,
+          sessionId,
+          nextNumber,
+        );
+
+        if (response.ok) {
+          // New message found! Fetch it and any subsequent messages
+          const data = await response.json();
+          messageBodiesCacheRef.current.set(data.number, data.message);
+
+          // Keep fetching until we get a 404
+          let currentNumber = nextNumber + 1;
+          let hasMore = true;
+
+          while (hasMore) {
+            const nextResponse = await api.messageByNumber(
+              projectName,
+              sessionId,
+              currentNumber,
+            );
+
+            if (nextResponse.ok) {
+              const nextData = await nextResponse.json();
+              messageBodiesCacheRef.current.set(
+                nextData.number,
+                nextData.message,
+              );
+              currentNumber++;
+            } else {
+              hasMore = false;
+            }
+          }
+
+          // Update last known number
+          lastKnownMessageNumberRef.current = currentNumber - 1;
+
+          // Reload session messages to update UI
+          const messages = await loadSessionMessages(
+            projectName,
+            sessionId,
+            false,
+            "claude",
+          );
+          setSessionMessages(messages);
+        }
+        // If 404, no new messages - poll again after interval
+      } catch (error) {
+        console.error("Error polling for new messages:", error);
+      }
+    },
+    [loadSessionMessages],
   );
 
   // Load Cursor session messages from SQLite via backend
@@ -4080,6 +4231,15 @@ function ChatInterface({
           setMessagesOffset(0);
           setHasMoreMessages(false);
           setTotalMessages(0);
+          // Reset message caches for efficient loading
+          messageListCacheRef.current = null;
+          messageBodiesCacheRef.current = new Map();
+          lastKnownMessageNumberRef.current = 0;
+          // Clear polling timer
+          if (messagePollingRef.current) {
+            clearInterval(messagePollingRef.current);
+            messagePollingRef.current = null;
+          }
           // Reset token budget when switching sessions
           // It will update when user sends a message and receives new budget from WebSocket
           setTokenBudget(null);
@@ -4100,6 +4260,10 @@ function ChatInterface({
           setMessagesOffset(0);
           setHasMoreMessages(false);
           setTotalMessages(0);
+          // Reset message caches for efficient loading
+          messageListCacheRef.current = null;
+          messageBodiesCacheRef.current = new Map();
+          lastKnownMessageNumberRef.current = 0;
 
           // Check if the session is currently processing on the backend
           if (ws && sendMessage) {
@@ -4176,6 +4340,15 @@ function ChatInterface({
         setMessagesOffset(0);
         setHasMoreMessages(false);
         setTotalMessages(0);
+        // Clear message caches
+        messageListCacheRef.current = null;
+        messageBodiesCacheRef.current = new Map();
+        lastKnownMessageNumberRef.current = 0;
+        // Clear polling timer
+        if (messagePollingRef.current) {
+          clearInterval(messagePollingRef.current);
+          messagePollingRef.current = null;
+        }
       }
 
       // Mark loading as complete after messages are set
@@ -4251,6 +4424,38 @@ function ChatInterface({
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
+  ]);
+
+  // Polling for new messages when chat is active (Claude provider only)
+  useEffect(() => {
+    const provider = localStorage.getItem("selected-provider") || "claude";
+
+    // Only poll for Claude sessions when chat window is up and not actively loading
+    if (
+      selectedSession &&
+      selectedProject &&
+      provider === "claude" &&
+      !isLoading &&
+      !isLoadingSessionMessages
+    ) {
+      // Start polling
+      messagePollingRef.current = setInterval(() => {
+        pollForNewMessages(selectedProject.name, selectedSession.id);
+      }, MESSAGE_POLL_INTERVAL);
+
+      return () => {
+        if (messagePollingRef.current) {
+          clearInterval(messagePollingRef.current);
+          messagePollingRef.current = null;
+        }
+      };
+    }
+  }, [
+    selectedSession,
+    selectedProject,
+    isLoading,
+    isLoadingSessionMessages,
+    pollForNewMessages,
   ]);
 
   // Manual refresh function with ETag caching support

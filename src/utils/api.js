@@ -119,6 +119,51 @@ export const api = {
     }
     return authenticatedFetch(url, options);
   },
+
+  // NEW: Efficient message list endpoint (IDs and numbers only)
+  messagesList: (projectName, sessionId, etag = null, signal = null) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/list`;
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
+  // NEW: Get single message by number (1-indexed)
+  messageByNumber: (
+    projectName,
+    sessionId,
+    messageNumber,
+    etag = null,
+    signal = null,
+  ) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/number/${messageNumber}`;
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
+  // NEW: Get messages by range
+  messagesByRange: (projectName, sessionId, start, end, signal = null) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/range/${start}/${end}`;
+    const options = {};
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
   renameProject: (projectName, displayName) =>
     authenticatedFetch(
       `/api/projects/${encodeURIComponent(projectName)}/rename`,

@@ -113,6 +113,13 @@ import userRoutes from "./routes/user.js";
 import codexRoutes from "./routes/codex.js";
 import sessionsRoutes from "./routes/sessions.js";
 import { updateSessionsCache } from "./sessions-cache.js";
+import {
+  getMessageList,
+  getMessageByNumber,
+  getMessagesByRange,
+  LIST_CACHE_TTL,
+  MESSAGE_CACHE_TTL,
+} from "./messages-cache.js";
 import { updateProjectsCache } from "./projects-cache.js";
 import { initializeDatabase, tmuxSessionsDb } from "./database/db.js";
 import {
@@ -759,6 +766,130 @@ app.get(
         res.json(result);
       }
     } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// NEW: Get message list (IDs and numbers only) - cached for 60 seconds
+// This is the efficient way to check for new messages
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/list",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId } = req.params;
+
+      const result = await getMessageList(projectName, sessionId);
+
+      // Generate ETag based on total count and cache timestamp
+      const currentETag = `"list-${sessionId}-${result.total}-${result.cachedAt}"`;
+
+      // Check If-None-Match header
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers - 60 second cache
+      res.set({
+        "Cache-Control": `private, max-age=${Math.floor(LIST_CACHE_TTL / 1000)}`,
+        ETag: currentETag,
+      });
+
+      res.json(result);
+    } catch (error) {
+      console.error("[MessagesListEndpoint] Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// NEW: Get a single message by number (1-indexed) - cached for 30 minutes
+// Messages are immutable, so they can be cached for a long time
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/number/:messageNumber",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId, messageNumber } = req.params;
+      const num = parseInt(messageNumber, 10);
+
+      if (isNaN(num) || num < 1) {
+        return res.status(400).json({ error: "Invalid message number" });
+      }
+
+      const message = await getMessageByNumber(projectName, sessionId, num);
+
+      if (!message) {
+        return res.status(404).json({ error: "Message not found" });
+      }
+
+      // Generate ETag based on message ID and timestamp
+      const msgId = message.uuid || message.id || `msg_${num}`;
+      const currentETag = `"msg-${sessionId}-${num}-${msgId}"`;
+
+      // Check If-None-Match header
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers - 30 minute cache (messages don't change)
+      res.set({
+        "Cache-Control": `private, max-age=${Math.floor(MESSAGE_CACHE_TTL / 1000)}`,
+        ETag: currentETag,
+      });
+
+      res.json({ number: num, message });
+    } catch (error) {
+      console.error("[MessageByNumberEndpoint] Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// NEW: Get messages by number range - for batch fetching
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/range/:start/:end",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId, start, end } = req.params;
+      const startNum = parseInt(start, 10);
+      const endNum = parseInt(end, 10);
+
+      if (
+        isNaN(startNum) ||
+        isNaN(endNum) ||
+        startNum < 1 ||
+        endNum < startNum
+      ) {
+        return res.status(400).json({ error: "Invalid range" });
+      }
+
+      // Limit range to prevent abuse
+      if (endNum - startNum > 100) {
+        return res
+          .status(400)
+          .json({ error: "Range too large (max 100 messages)" });
+      }
+
+      const messages = await getMessagesByRange(
+        projectName,
+        sessionId,
+        startNum,
+        endNum,
+      );
+
+      // Set short cache - range queries are typically for initial load
+      res.set({
+        "Cache-Control": "private, max-age=30",
+      });
+
+      res.json({ messages, start: startNum, end: endNum });
+    } catch (error) {
+      console.error("[MessageRangeEndpoint] Error:", error.message);
       res.status(500).json({ error: error.message });
     }
   },
