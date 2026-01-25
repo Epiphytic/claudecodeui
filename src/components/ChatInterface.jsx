@@ -69,6 +69,14 @@ function decodeHtmlEntities(text) {
     .replace(/&amp;/g, "&");
 }
 
+// Format polling interval for display (e.g., "5s", "30s", "2m", "20m")
+function formatPollInterval(ms) {
+  if (ms < 60000) {
+    return `${Math.round(ms / 1000)}s`;
+  }
+  return `${Math.round(ms / 60000)}m`;
+}
+
 // Parse task notification XML content
 function parseTaskNotification(text) {
   if (!text || typeof text !== "string") return null;
@@ -2813,8 +2821,20 @@ function ChatInterface({
   const lastKnownMessageNumberRef = useRef(0);
   const messageListLastFetchedRef = useRef(0); // Timestamp of last list fetch
   const messagePollingRef = useRef(null); // Polling timer reference
-  const MESSAGE_POLL_INTERVAL = 10000; // 10 seconds between polls
-  const MESSAGE_LIST_BACKUP_INTERVAL = 5 * 60 * 1000; // 5 minutes - only refresh list as backup
+  const listPollingRef = useRef(null); // List backup polling timer
+
+  // Exponential backoff for message polling
+  const MESSAGE_POLL_INITIAL = 5000; // 5 seconds initial
+  const MESSAGE_POLL_MAX = 20 * 60 * 1000; // 20 minutes max
+  const LIST_POLL_INITIAL = 60 * 1000; // 1 minute initial
+  const LIST_POLL_MAX = 60 * 60 * 1000; // 1 hour max
+  const BACKOFF_MULTIPLIER = 1.5;
+
+  const [messagePollInterval, setMessagePollInterval] =
+    useState(MESSAGE_POLL_INITIAL);
+  const [listPollInterval, setListPollInterval] = useState(LIST_POLL_INITIAL);
+  const messagePollIntervalRef = useRef(MESSAGE_POLL_INITIAL);
+  const listPollIntervalRef = useRef(LIST_POLL_INITIAL);
   // Streaming throttle buffers
   const streamBufferRef = useRef("");
   const streamTimerRef = useRef(null);
@@ -3502,65 +3522,105 @@ function ChatInterface({
     [messagesOffset],
   );
 
+  // Reset polling intervals to initial values
+  const resetPollingIntervals = useCallback(() => {
+    messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+    listPollIntervalRef.current = LIST_POLL_INITIAL;
+    setMessagePollInterval(MESSAGE_POLL_INITIAL);
+    setListPollInterval(LIST_POLL_INITIAL);
+  }, []);
+
+  // Increase message poll interval with exponential backoff
+  const increaseMessagePollInterval = useCallback(() => {
+    const newInterval = Math.min(
+      messagePollIntervalRef.current * BACKOFF_MULTIPLIER,
+      MESSAGE_POLL_MAX,
+    );
+    messagePollIntervalRef.current = newInterval;
+    setMessagePollInterval(newInterval);
+  }, []);
+
+  // Increase list poll interval with exponential backoff
+  const increaseListPollInterval = useCallback(() => {
+    const newInterval = Math.min(
+      listPollIntervalRef.current * BACKOFF_MULTIPLIER,
+      LIST_POLL_MAX,
+    );
+    listPollIntervalRef.current = newInterval;
+    setListPollInterval(newInterval);
+  }, []);
+
   // Poll for new messages when chat is active
   // Messages are immutable - just append new ones without re-fetching the list
-  const pollForNewMessages = useCallback(async (projectName, sessionId) => {
-    if (!projectName || !sessionId) return;
+  // Returns true if new messages were found
+  const pollForNewMessages = useCallback(
+    async (projectName, sessionId) => {
+      if (!projectName || !sessionId) return false;
 
-    const nextNumber = lastKnownMessageNumberRef.current + 1;
-    const newMessages = [];
+      const nextNumber = lastKnownMessageNumberRef.current + 1;
+      const newMessages = [];
 
-    try {
-      const response = await api.messageByNumber(
-        projectName,
-        sessionId,
-        nextNumber,
-      );
+      try {
+        const response = await api.messageByNumber(
+          projectName,
+          sessionId,
+          nextNumber,
+        );
 
-      if (response.ok) {
-        // New message found! Fetch it and any subsequent messages
-        const data = await response.json();
-        messageBodiesCacheRef.current.set(data.number, data.message);
-        newMessages.push(data.message);
+        if (response.ok) {
+          // New message found! Fetch it and any subsequent messages
+          const data = await response.json();
+          messageBodiesCacheRef.current.set(data.number, data.message);
+          newMessages.push(data.message);
 
-        // Keep fetching until we get a 404
-        let currentNumber = nextNumber + 1;
-        let hasMore = true;
+          // Keep fetching until we get a 404
+          let currentNumber = nextNumber + 1;
+          let hasMore = true;
 
-        while (hasMore) {
-          const nextResponse = await api.messageByNumber(
-            projectName,
-            sessionId,
-            currentNumber,
-          );
-
-          if (nextResponse.ok) {
-            const nextData = await nextResponse.json();
-            messageBodiesCacheRef.current.set(
-              nextData.number,
-              nextData.message,
+          while (hasMore) {
+            const nextResponse = await api.messageByNumber(
+              projectName,
+              sessionId,
+              currentNumber,
             );
-            newMessages.push(nextData.message);
-            currentNumber++;
-          } else {
-            hasMore = false;
+
+            if (nextResponse.ok) {
+              const nextData = await nextResponse.json();
+              messageBodiesCacheRef.current.set(
+                nextData.number,
+                nextData.message,
+              );
+              newMessages.push(nextData.message);
+              currentNumber++;
+            } else {
+              hasMore = false;
+            }
+          }
+
+          // Update last known number
+          lastKnownMessageNumberRef.current = currentNumber - 1;
+
+          // Append new messages directly to state (messages are immutable, no need to re-fetch list)
+          if (newMessages.length > 0) {
+            setSessionMessages((prev) => [...prev, ...newMessages]);
+            setTotalMessages((prev) => prev + newMessages.length);
+            // Reset polling intervals when new messages found
+            resetPollingIntervals();
+            return true;
           }
         }
-
-        // Update last known number
-        lastKnownMessageNumberRef.current = currentNumber - 1;
-
-        // Append new messages directly to state (messages are immutable, no need to re-fetch list)
-        if (newMessages.length > 0) {
-          setSessionMessages((prev) => [...prev, ...newMessages]);
-          setTotalMessages((prev) => prev + newMessages.length);
-        }
+        // If 404, no new messages - increase backoff
+        increaseMessagePollInterval();
+        return false;
+      } catch (error) {
+        console.error("Error polling for new messages:", error);
+        // On error, also increase backoff
+        increaseMessagePollInterval();
+        return false;
       }
-      // If 404, no new messages - poll again after interval
-    } catch (error) {
-      console.error("Error polling for new messages:", error);
-    }
-  }, []);
+    },
+    [resetPollingIntervals, increaseMessagePollInterval],
+  );
 
   // Load Cursor session messages from SQLite via backend
   const loadCursorSessionMessages = useCallback(
@@ -4262,10 +4322,19 @@ function ChatInterface({
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
           messageListLastFetchedRef.current = 0;
-          // Clear polling timer
+          // Reset polling intervals to initial values
+          messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+          listPollIntervalRef.current = LIST_POLL_INITIAL;
+          setMessagePollInterval(MESSAGE_POLL_INITIAL);
+          setListPollInterval(LIST_POLL_INITIAL);
+          // Clear polling timers
           if (messagePollingRef.current) {
-            clearInterval(messagePollingRef.current);
+            clearTimeout(messagePollingRef.current);
             messagePollingRef.current = null;
+          }
+          if (listPollingRef.current) {
+            clearTimeout(listPollingRef.current);
+            listPollingRef.current = null;
           }
           // Reset token budget when switching sessions
           // It will update when user sends a message and receives new budget from WebSocket
@@ -4292,6 +4361,11 @@ function ChatInterface({
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
           messageListLastFetchedRef.current = 0;
+          // Reset polling intervals to initial values
+          messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+          listPollIntervalRef.current = LIST_POLL_INITIAL;
+          setMessagePollInterval(MESSAGE_POLL_INITIAL);
+          setListPollInterval(LIST_POLL_INITIAL);
 
           // Check if the session is currently processing on the backend
           if (ws && sendMessage) {
@@ -4373,10 +4447,19 @@ function ChatInterface({
         messageBodiesCacheRef.current = new Map();
         lastKnownMessageNumberRef.current = 0;
         messageListLastFetchedRef.current = 0;
-        // Clear polling timer
+        // Reset polling intervals to initial values
+        messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+        listPollIntervalRef.current = LIST_POLL_INITIAL;
+        setMessagePollInterval(MESSAGE_POLL_INITIAL);
+        setListPollInterval(LIST_POLL_INITIAL);
+        // Clear polling timers
         if (messagePollingRef.current) {
-          clearInterval(messagePollingRef.current);
+          clearTimeout(messagePollingRef.current);
           messagePollingRef.current = null;
+        }
+        if (listPollingRef.current) {
+          clearTimeout(listPollingRef.current);
+          listPollingRef.current = null;
         }
       }
 
@@ -4456,6 +4539,7 @@ function ChatInterface({
   ]);
 
   // Polling for new messages when chat is active (Claude provider only)
+  // Uses exponential backoff - starts at 5s, increases to 20min max
   useEffect(() => {
     const provider = localStorage.getItem("selected-provider") || "claude";
 
@@ -4467,14 +4551,20 @@ function ChatInterface({
       !isLoading &&
       !isLoadingSessionMessages
     ) {
-      // Start polling
-      messagePollingRef.current = setInterval(() => {
-        pollForNewMessages(selectedProject.name, selectedSession.id);
-      }, MESSAGE_POLL_INTERVAL);
+      // Use setTimeout with dynamic interval for exponential backoff
+      const scheduleNextPoll = () => {
+        messagePollingRef.current = setTimeout(async () => {
+          await pollForNewMessages(selectedProject.name, selectedSession.id);
+          // Schedule next poll with current interval (may have changed)
+          scheduleNextPoll();
+        }, messagePollIntervalRef.current);
+      };
+
+      scheduleNextPoll();
 
       return () => {
         if (messagePollingRef.current) {
-          clearInterval(messagePollingRef.current);
+          clearTimeout(messagePollingRef.current);
           messagePollingRef.current = null;
         }
       };
@@ -4487,7 +4577,108 @@ function ChatInterface({
     pollForNewMessages,
   ]);
 
-  // Manual refresh function using efficient cached message loading
+  // Backup list polling with exponential backoff (starts at 1min, up to 1hr)
+  useEffect(() => {
+    const provider = localStorage.getItem("selected-provider") || "claude";
+
+    if (
+      selectedSession &&
+      selectedProject &&
+      provider === "claude" &&
+      !isLoading &&
+      !isLoadingSessionMessages
+    ) {
+      const scheduleListPoll = () => {
+        listPollingRef.current = setTimeout(async () => {
+          // Fetch the messages list as backup
+          try {
+            const listResponse = await api.messagesList(
+              selectedProject.name,
+              selectedSession.id,
+              messageListCacheRef.current?.etag,
+            );
+
+            if (listResponse.ok) {
+              const listData = await listResponse.json();
+              const etag = listResponse.headers.get("etag");
+
+              // Check if we have new messages
+              const currentCount = lastKnownMessageNumberRef.current;
+              if (listData.total > currentCount) {
+                // New messages! Fetch them
+                for (let i = currentCount + 1; i <= listData.total; i++) {
+                  const msgResponse = await api.messageByNumber(
+                    selectedProject.name,
+                    selectedSession.id,
+                    i,
+                  );
+                  if (msgResponse.ok) {
+                    const msgData = await msgResponse.json();
+                    messageBodiesCacheRef.current.set(
+                      msgData.number,
+                      msgData.message,
+                    );
+                  }
+                }
+                lastKnownMessageNumberRef.current = listData.total;
+
+                // Rebuild messages array
+                const messages = [];
+                for (let i = 1; i <= listData.total; i++) {
+                  if (messageBodiesCacheRef.current.has(i)) {
+                    messages.push(messageBodiesCacheRef.current.get(i));
+                  }
+                }
+                setSessionMessages(messages);
+                setTotalMessages(listData.total);
+
+                // Reset intervals on new messages
+                resetPollingIntervals();
+              } else {
+                // No new messages, increase backoff
+                increaseListPollInterval();
+              }
+
+              // Update cache
+              messageListCacheRef.current = {
+                messages: listData.messages,
+                total: listData.total,
+                etag,
+              };
+              messageListLastFetchedRef.current = Date.now();
+            } else if (listResponse.status !== 304) {
+              // Error (not 304), increase backoff
+              increaseListPollInterval();
+            }
+          } catch (error) {
+            console.error("Error in list backup poll:", error);
+            increaseListPollInterval();
+          }
+
+          // Schedule next poll
+          scheduleListPoll();
+        }, listPollIntervalRef.current);
+      };
+
+      scheduleListPoll();
+
+      return () => {
+        if (listPollingRef.current) {
+          clearTimeout(listPollingRef.current);
+          listPollingRef.current = null;
+        }
+      };
+    }
+  }, [
+    selectedSession,
+    selectedProject,
+    isLoading,
+    isLoadingSessionMessages,
+    resetPollingIntervals,
+    increaseListPollInterval,
+  ]);
+
+  // Manual refresh function - fetches messages/list and resets polling intervals
   const refreshMessages = useCallback(async () => {
     if (!selectedSession || !selectedProject || isLoading) return;
 
@@ -4500,8 +4691,58 @@ function ChatInterface({
     setIsRefreshingMessages(true);
 
     try {
-      // Use the efficient polling mechanism to check for new messages
-      await pollForNewMessages(selectedProject.name, selectedSession.id);
+      // Reset polling intervals on manual refresh
+      resetPollingIntervals();
+
+      // Fetch the messages list directly
+      const listResponse = await api.messagesList(
+        selectedProject.name,
+        selectedSession.id,
+        null, // Don't use etag - force fresh fetch
+      );
+
+      if (listResponse.ok) {
+        const listData = await listResponse.json();
+        const etag = listResponse.headers.get("etag");
+
+        // Fetch any missing messages
+        const currentCount = lastKnownMessageNumberRef.current;
+        if (listData.total > currentCount) {
+          for (let i = currentCount + 1; i <= listData.total; i++) {
+            const msgResponse = await api.messageByNumber(
+              selectedProject.name,
+              selectedSession.id,
+              i,
+            );
+            if (msgResponse.ok) {
+              const msgData = await msgResponse.json();
+              messageBodiesCacheRef.current.set(
+                msgData.number,
+                msgData.message,
+              );
+            }
+          }
+          lastKnownMessageNumberRef.current = listData.total;
+        }
+
+        // Rebuild messages array
+        const messages = [];
+        for (let i = 1; i <= listData.total; i++) {
+          if (messageBodiesCacheRef.current.has(i)) {
+            messages.push(messageBodiesCacheRef.current.get(i));
+          }
+        }
+        setSessionMessages(messages);
+        setTotalMessages(listData.total);
+
+        // Update cache
+        messageListCacheRef.current = {
+          messages: listData.messages,
+          total: listData.total,
+          etag,
+        };
+        messageListLastFetchedRef.current = Date.now();
+      }
 
       // Scroll to bottom if user was already near bottom
       if (isNearBottom && autoScrollToBottom) {
@@ -4521,12 +4762,13 @@ function ChatInterface({
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
-    pollForNewMessages,
+    resetPollingIntervals,
   ]);
 
-  // Note: Auto-refresh is now handled by the polling effect above (messagePollingRef)
-  // The polling system checks for new messages every 10 seconds when the chat is active
-  // Message caches are reset when session changes (in the loadMessages effect)
+  // Note: Auto-refresh uses exponential backoff polling
+  // Message poll: starts at 5s, backs off to 20min max
+  // List poll: starts at 1min, backs off to 1hr max
+  // Intervals reset when new messages found or manual refresh
 
   // Update chatMessages when convertedMessages changes
   useEffect(() => {
@@ -7275,42 +7517,53 @@ function ChatInterface({
                 />
               )}
 
-              {/* Refresh messages button */}
-              <button
-                type="button"
-                onClick={refreshMessages}
-                disabled={isRefreshingMessages || isLoading || !selectedSession}
-                className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800 ${
-                  isRefreshingMessages
-                    ? "text-blue-500 dark:text-blue-400"
-                    : externalSessionWarning
-                      ? "text-orange-500 hover:text-orange-600 dark:text-orange-400 dark:hover:text-orange-300"
-                      : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-                } ${!selectedSession ? "opacity-50 cursor-not-allowed" : ""}`}
-                title={
-                  externalSessionWarning
-                    ? "Refresh messages (auto-refreshing every 10s due to external session)"
-                    : "Refresh messages"
-                }
-              >
-                <svg
-                  className={`w-4 h-4 ${isRefreshingMessages ? "animate-spin" : ""}`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
+              {/* Refresh messages button with polling interval indicator */}
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={refreshMessages}
+                  disabled={
+                    isRefreshingMessages || isLoading || !selectedSession
+                  }
+                  className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800 ${
+                    isRefreshingMessages
+                      ? "text-blue-500 dark:text-blue-400"
+                      : externalSessionWarning
+                        ? "text-orange-500 hover:text-orange-600 dark:text-orange-400 dark:hover:text-orange-300"
+                        : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                  } ${!selectedSession ? "opacity-50 cursor-not-allowed" : ""}`}
+                  title={`Refresh messages (next poll: ${formatPollInterval(messagePollInterval)})`}
                 >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                  />
-                </svg>
-                {/* Auto-refresh indicator dot */}
-                {externalSessionWarning && !isRefreshingMessages && (
-                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
-                )}
-              </button>
+                  <svg
+                    className={`w-4 h-4 ${isRefreshingMessages ? "animate-spin" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                    />
+                  </svg>
+                  {/* Auto-refresh indicator dot */}
+                  {externalSessionWarning && !isRefreshingMessages && (
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
+                  )}
+                </button>
+                {/* Polling interval indicator */}
+                {selectedSession &&
+                  (localStorage.getItem("selected-provider") || "claude") ===
+                    "claude" && (
+                    <span
+                      className="text-xs text-gray-400 dark:text-gray-500 tabular-nums"
+                      title={`Next message poll in ${formatPollInterval(messagePollInterval)}`}
+                    >
+                      {formatPollInterval(messagePollInterval)}
+                    </span>
+                  )}
+              </div>
 
               {/* Token usage pie chart - positioned next to mode indicator */}
               <TokenUsagePie
