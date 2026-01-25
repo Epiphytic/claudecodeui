@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/Epiphytic/claudecodeui/compare/v1.1.0...v1.2.0) (2026-01-25)
+
+
+### Features
+
+* warn existing claude code session ([#4](https://github.com/Epiphytic/claudecodeui/issues/4)) ([057bae3](https://github.com/Epiphytic/claudecodeui/commit/057bae38ef22888d3d7ec21c5320558eff590be5))
+
 # [1.1.0](https://github.com/Epiphytic/claudecodeui/compare/v1.0.1...v1.1.0) (2026-01-24)
 
 
