@@ -2557,9 +2557,22 @@ app.get(
         fileContent = await fsPromises.readFile(jsonlPath, "utf8");
       } catch (error) {
         if (error.code === "ENOENT") {
-          return res
-            .status(404)
-            .json({ error: "Session file not found", path: jsonlPath });
+          // Session file doesn't exist yet (new session with no messages)
+          // Return zero token usage instead of 404
+          const parsedContextWindow = parseInt(process.env.CONTEXT_WINDOW, 10);
+          const contextWindow = Number.isFinite(parsedContextWindow)
+            ? parsedContextWindow
+            : 160000;
+          return res.json({
+            used: 0,
+            total: contextWindow,
+            breakdown: {
+              input: 0,
+              cacheCreation: 0,
+              cacheRead: 0,
+            },
+            newSession: true,
+          });
         }
         throw error; // Re-throw other errors to be caught by outer try-catch
       }
