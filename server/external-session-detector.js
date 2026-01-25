@@ -27,10 +27,12 @@ const currentPid = process.pid;
 
 /**
  * Detect external Claude processes
- * @returns {Array<{ pid: number, command: string, cwd: string | null }>}
+ * @returns {{ processes: Array<{ pid: number, command: string, cwd: string | null }>, detectionAvailable: boolean, error: string | null }}
  */
 function detectClaudeProcesses() {
   const processes = [];
+  let detectionAvailable = true;
+  let error = null;
 
   if (os.platform() === "win32") {
     // Windows: use wmic or tasklist
@@ -58,72 +60,125 @@ function detectClaudeProcesses() {
             }
           }
         }
+      } else if (result.error) {
+        detectionAvailable = false;
+        error = `wmic not available: ${result.error.message}`;
       }
-    } catch {
-      // Ignore errors on Windows
+    } catch (e) {
+      detectionAvailable = false;
+      error = `Windows process detection failed: ${e.message}`;
     }
   } else {
     // Unix: use pgrep and ps
     try {
-      // First, get PIDs of claude processes
-      const pgrepResult = spawnSync("pgrep", ["-f", "claude"], {
+      // First, check if pgrep is available
+      const pgrepCheck = spawnSync("which", ["pgrep"], {
         encoding: "utf8",
         stdio: "pipe",
       });
 
-      if (pgrepResult.status === 0) {
-        const pids = pgrepResult.stdout.trim().split("\n").filter(Boolean);
-
-        for (const pidStr of pids) {
-          const pid = parseInt(pidStr, 10);
-
-          // Skip our own process and child processes
-          if (pid === currentPid) continue;
-
-          // Get command details
-          const psResult = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
+      if (pgrepCheck.status !== 0) {
+        // pgrep not available, try ps aux as fallback
+        try {
+          const psResult = spawnSync("ps", ["aux"], {
             encoding: "utf8",
             stdio: "pipe",
           });
 
           if (psResult.status === 0) {
-            const command = psResult.stdout.trim();
-
-            // Filter out our own subprocesses (claude-sdk spawned by this app)
-            // and only include standalone claude CLI invocations
-            if (isExternalClaudeProcess(command)) {
-              // Try to get working directory via lsof
-              let cwd = null;
-              try {
-                const lsofResult = spawnSync(
-                  "lsof",
-                  ["-p", String(pid), "-Fn"],
-                  {
-                    encoding: "utf8",
-                    stdio: "pipe",
-                  },
-                );
-                if (lsofResult.status === 0) {
-                  const cwdMatch = lsofResult.stdout.match(/n(\/[^\n]+)/);
-                  if (cwdMatch) {
-                    cwd = cwdMatch[1];
+            const lines = psResult.stdout.split("\n");
+            for (const line of lines) {
+              if (
+                line.toLowerCase().includes("claude") &&
+                !line.includes(String(currentPid))
+              ) {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 2) {
+                  const pid = parseInt(parts[1], 10);
+                  if (!isNaN(pid) && pid !== currentPid) {
+                    const command = parts.slice(10).join(" ");
+                    if (isExternalClaudeProcess(command)) {
+                      processes.push({ pid, command, cwd: null });
+                    }
                   }
                 }
-              } catch {
-                // lsof may not be available
               }
+            }
+          } else {
+            detectionAvailable = false;
+            error = "Neither pgrep nor ps aux available";
+          }
+        } catch (e) {
+          detectionAvailable = false;
+          error = `Process detection failed: ${e.message}`;
+        }
+      } else {
+        // pgrep is available, use it
+        const pgrepResult = spawnSync("pgrep", ["-f", "claude"], {
+          encoding: "utf8",
+          stdio: "pipe",
+        });
 
-              processes.push({ pid, command, cwd });
+        if (pgrepResult.status === 0) {
+          const pids = pgrepResult.stdout.trim().split("\n").filter(Boolean);
+
+          for (const pidStr of pids) {
+            const pid = parseInt(pidStr, 10);
+
+            // Skip our own process and child processes
+            if (pid === currentPid) continue;
+
+            // Get command details
+            const psResult = spawnSync(
+              "ps",
+              ["-p", String(pid), "-o", "args="],
+              {
+                encoding: "utf8",
+                stdio: "pipe",
+              },
+            );
+
+            if (psResult.status === 0) {
+              const command = psResult.stdout.trim();
+
+              // Filter out our own subprocesses (claude-sdk spawned by this app)
+              // and only include standalone claude CLI invocations
+              if (isExternalClaudeProcess(command)) {
+                // Try to get working directory via lsof
+                let cwd = null;
+                try {
+                  const lsofResult = spawnSync(
+                    "lsof",
+                    ["-p", String(pid), "-Fn"],
+                    {
+                      encoding: "utf8",
+                      stdio: "pipe",
+                    },
+                  );
+                  if (lsofResult.status === 0) {
+                    const cwdMatch = lsofResult.stdout.match(/n(\/[^\n]+)/);
+                    if (cwdMatch) {
+                      cwd = cwdMatch[1];
+                    }
+                  }
+                } catch {
+                  // lsof may not be available - not critical
+                }
+
+                processes.push({ pid, command, cwd });
+              }
             }
           }
         }
+        // pgrep returning non-zero just means no processes found, not an error
       }
-    } catch {
-      // Ignore errors
+    } catch (e) {
+      detectionAvailable = false;
+      error = `Unix process detection failed: ${e.message}`;
     }
   }
 
-  return processes;
+  return { processes, detectionAvailable, error };
 }
 
 /**
@@ -284,7 +339,7 @@ function processExists(pid) {
 /**
  * Main detection function - detect all external Claude sessions
  * @param {string} projectPath - The project directory to check
- * @returns {{ hasExternalSession: boolean, processes: Array, tmuxSessions: Array, lockFile: object }}
+ * @returns {{ hasExternalSession: boolean, processes: Array, tmuxSessions: Array, lockFile: object, detectionAvailable: boolean, detectionError: string | null }}
  */
 function detectExternalClaude(projectPath) {
   // Check cache
@@ -299,10 +354,16 @@ function detectExternalClaude(projectPath) {
     processes: [],
     tmuxSessions: [],
     lockFile: { exists: false, lockFile: null, content: null },
+    detectionAvailable: true,
+    detectionError: null,
   };
 
   // Detect processes
-  result.processes = detectClaudeProcesses();
+  const processDetection = detectClaudeProcesses();
+  result.processes = processDetection.processes;
+  result.detectionAvailable = processDetection.detectionAvailable;
+  result.detectionError = processDetection.error;
+
   if (projectPath) {
     // Filter to processes in this project
     result.processes = result.processes.filter(

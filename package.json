@@ -12,6 +12,7 @@
     "server/",
     "shared/",
     "dist/",
+    "public/",
     "README.md"
   ],
   "homepage": "https://claudecodeui.siteboon.ai",

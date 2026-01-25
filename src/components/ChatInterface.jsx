@@ -653,7 +653,13 @@ const MessageComponent = memo(
           <div className="flex items-end space-x-0 sm:space-x-3 w-full sm:w-auto sm:max-w-[85%] md:max-w-md lg:max-w-lg xl:max-w-xl">
             <div className="bg-blue-600 text-white rounded-2xl rounded-br-md px-3 sm:px-4 py-2 shadow-sm flex-1 sm:flex-initial">
               <div className="text-sm whitespace-pre-wrap break-words">
-                {message.content}
+                {message.isSlashCommand ? (
+                  <span className="font-mono bg-blue-700/50 px-1.5 py-0.5 rounded">
+                    {message.content}
+                  </span>
+                ) : (
+                  message.content
+                )}
               </div>
               {message.images && message.images.length > 0 && (
                 <div className="mt-2 grid grid-cols-2 gap-2">
@@ -2728,6 +2734,8 @@ function ChatInterface({
   const [isRefreshingMessages, setIsRefreshingMessages] = useState(false);
   const messagesEtagRef = useRef(null);
   const autoRefreshIntervalRef = useRef(null);
+  const statusTimeoutRef = useRef(null);
+  const STATUS_TIMEOUT_MS = 60000; // 60 seconds without status update = reset loading
   const [provider, setProvider] = useState(() => {
     return localStorage.getItem("selected-provider") || "claude";
   });
@@ -3693,26 +3701,48 @@ function ChatInterface({
         }
 
         // Skip command messages, system messages, and empty content
+        const trimmedContent = (content || "").trim();
+        const isCommandContent =
+          trimmedContent.startsWith("<command-name>") ||
+          trimmedContent.startsWith("<command-message>") ||
+          trimmedContent.startsWith("<command-args>") ||
+          trimmedContent.startsWith("<local-command-stdout>") ||
+          trimmedContent.startsWith("<system-reminder>") ||
+          trimmedContent.includes("<skill-content>");
+
+        // Extract slash command from skill content to show as user message
+        let displayContent = content;
+        let isSlashCommand = false;
+        if (isCommandContent) {
+          // Try to extract the slash command name from skill content
+          const commandMatch = trimmedContent.match(
+            /<command-name>\/([^<]+)<\/command-name>/,
+          );
+          if (commandMatch) {
+            displayContent = `/${commandMatch[1]}`;
+            isSlashCommand = true;
+          }
+        }
+
         const shouldSkip =
-          !content ||
-          content.startsWith("<command-name>") ||
-          content.startsWith("<command-message>") ||
-          content.startsWith("<command-args>") ||
-          content.startsWith("<local-command-stdout>") ||
-          content.startsWith("<system-reminder>") ||
-          content.startsWith("Caveat:") ||
-          content.startsWith(
+          !trimmedContent ||
+          (isCommandContent && !isSlashCommand) ||
+          trimmedContent.startsWith("Caveat:") ||
+          trimmedContent.startsWith(
             "This session is being continued from a previous",
           ) ||
-          content.startsWith("[Request interrupted");
+          trimmedContent.startsWith("[Request interrupted");
 
         if (!shouldSkip) {
-          // Unescape with math formula protection
-          content = unescapeWithMathProtection(content);
+          // Unescape with math formula protection (unless it's a slash command)
+          if (!isSlashCommand) {
+            displayContent = unescapeWithMathProtection(displayContent);
+          }
           converted.push({
             type: messageType,
-            content: content,
+            content: displayContent,
             timestamp: msg.timestamp || new Date().toISOString(),
+            isSlashCommand,
           });
         }
       }
@@ -4388,7 +4418,16 @@ function ChatInterface({
             setExternalSessionWarning({
               projectPath: latestMessage.projectPath,
               details: latestMessage.details,
+              detectionAvailable: latestMessage.detectionAvailable,
             });
+          } else if (!latestMessage.detectionAvailable) {
+            // Detection not available (e.g., on platforms without pgrep)
+            // Log but don't show warning - detection just isn't supported
+            console.log(
+              "[ChatInterface] External session detection not available:",
+              latestMessage.detectionError,
+            );
+            setExternalSessionWarning(null);
           } else {
             // Clear warning if no external session
             setExternalSessionWarning(null);
@@ -4984,6 +5023,11 @@ function ChatInterface({
             setIsLoading(false);
             setCanAbortSession(false);
             setClaudeStatus(null);
+            // Clear status timeout on completion
+            if (statusTimeoutRef.current) {
+              clearTimeout(statusTimeoutRef.current);
+              statusTimeoutRef.current = null;
+            }
           }
 
           // Always mark the completed session as inactive and not processing
@@ -5176,6 +5220,11 @@ function ChatInterface({
             setIsLoading(false);
             setCanAbortSession(false);
             setClaudeStatus(null);
+            // Clear status timeout on completion
+            if (statusTimeoutRef.current) {
+              clearTimeout(statusTimeoutRef.current);
+              statusTimeoutRef.current = null;
+            }
           }
 
           if (codexCompletedSessionId) {
@@ -5312,6 +5361,30 @@ function ChatInterface({
             setClaudeStatus(statusInfo);
             setIsLoading(true);
             setCanAbortSession(statusInfo.can_interrupt);
+
+            // Reset timeout on each status update
+            if (statusTimeoutRef.current) {
+              clearTimeout(statusTimeoutRef.current);
+            }
+            statusTimeoutRef.current = setTimeout(() => {
+              console.warn(
+                "[ChatInterface] Status timeout - no updates received for",
+                STATUS_TIMEOUT_MS / 1000,
+                "seconds",
+              );
+              setIsLoading(false);
+              setClaudeStatus(null);
+              setCanAbortSession(false);
+              setChatMessages((prev) => [
+                ...prev,
+                {
+                  type: "error",
+                  content:
+                    "Connection timeout: No response from the server. The session may have ended unexpectedly.",
+                  timestamp: new Date(),
+                },
+              ]);
+            }, STATUS_TIMEOUT_MS);
           }
           break;
       }
@@ -5324,6 +5397,28 @@ function ChatInterface({
       fetchProjectFiles();
     }
   }, [selectedProject]);
+
+  // Clear status timeout on unmount or when ws connection changes
+  useEffect(() => {
+    // If WebSocket is null/disconnected while loading, reset the loading state
+    if (!ws && isLoading) {
+      console.warn("[ChatInterface] WebSocket disconnected while loading");
+      setIsLoading(false);
+      setClaudeStatus(null);
+      setCanAbortSession(false);
+      if (statusTimeoutRef.current) {
+        clearTimeout(statusTimeoutRef.current);
+        statusTimeoutRef.current = null;
+      }
+    }
+
+    return () => {
+      if (statusTimeoutRef.current) {
+        clearTimeout(statusTimeoutRef.current);
+        statusTimeoutRef.current = null;
+      }
+    };
+  }, [ws, isLoading]);
 
   const fetchProjectFiles = async () => {
     try {

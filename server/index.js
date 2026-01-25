@@ -447,7 +447,7 @@ app.use("/api/sessions", authenticateToken, sessionsRoutes);
 // Agent API Routes (uses API key authentication)
 app.use("/api/agent", agentRoutes);
 
-// Serve public files (like api-docs.html, icons)
+// Serve public files (like api-docs.html, icons, manifest.json)
 // Enable ETag generation for conditional requests (304 support)
 app.use(
   express.static(path.join(__dirname, "../public"), {
@@ -461,6 +461,9 @@ app.use(
           "Cache-Control",
           "public, max-age=604800, must-revalidate",
         );
+      } else if (filePath.endsWith(".json")) {
+        // JSON files (like manifest.json) - short cache with revalidation
+        res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
       } else if (filePath.endsWith(".html")) {
         // HTML files should not be cached
         res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -483,6 +486,9 @@ app.use(
         res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
         res.setHeader("Pragma", "no-cache");
         res.setHeader("Expires", "0");
+      } else if (filePath.endsWith(".json")) {
+        // JSON files (like manifest.json) - short cache with revalidation
+        res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
       } else if (
         filePath.match(/\.(js|css|woff2?|ttf|eot|svg|png|jpg|jpeg|gif|ico)$/)
       ) {
@@ -1156,6 +1162,8 @@ async function handleChatMessage(ws, writer, messageData) {
           type: "external-session-check-result",
           projectPath,
           hasExternalSession: externalCheck.hasExternalSession,
+          detectionAvailable: externalCheck.detectionAvailable,
+          detectionError: externalCheck.detectionError,
           details: externalCheck.hasExternalSession
             ? {
                 processIds: externalCheck.processes.map((p) => p.pid),
@@ -1208,6 +1216,7 @@ async function handleChatMessage(ws, writer, messageData) {
           writer.send({
             type: "external-session-detected",
             projectPath,
+            detectionAvailable: externalCheck.detectionAvailable,
             details: {
               processIds: externalCheck.processes.map((p) => p.pid),
               tmuxSessions: externalCheck.tmuxSessions.map(
