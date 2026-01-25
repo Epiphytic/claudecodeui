@@ -69,6 +69,31 @@ function decodeHtmlEntities(text) {
     .replace(/&amp;/g, "&");
 }
 
+// Parse task notification XML content
+function parseTaskNotification(text) {
+  if (!text || typeof text !== "string") return null;
+  if (!text.includes("<task-notification>")) return null;
+
+  try {
+    const taskIdMatch = text.match(/<task-id>([^<]+)<\/task-id>/);
+    const outputFileMatch = text.match(/<output-file>([^<]+)<\/output-file>/);
+    const statusMatch = text.match(/<status>([^<]+)<\/status>/);
+    const summaryMatch = text.match(/<summary>([^<]+)<\/summary>/);
+
+    if (taskIdMatch && statusMatch && summaryMatch) {
+      return {
+        taskId: taskIdMatch[1].trim(),
+        outputFile: outputFileMatch ? outputFileMatch[1].trim() : null,
+        status: statusMatch[1].trim(),
+        summary: summaryMatch[1].trim(),
+      };
+    }
+  } catch {
+    // Failed to parse
+  }
+  return null;
+}
+
 // Normalize markdown text where providers mistakenly wrap short inline code with single-line triple fences.
 // Only convert fences that do NOT contain any newline to avoid touching real code blocks.
 function normalizeInlineCodeFences(text) {
@@ -2442,6 +2467,85 @@ const MessageComponent = memo(
                     <span className="font-medium">Read todo list</span>
                   </div>
                 </div>
+              ) : message.isTaskNotification && message.taskNotification ? (
+                // Task notification display
+                <div
+                  className={`border-l-2 pl-3 py-2 my-2 ${
+                    message.taskNotification.status === "failed"
+                      ? "bg-red-50/50 dark:bg-red-900/20 border-red-400 dark:border-red-500"
+                      : message.taskNotification.status === "completed"
+                        ? "bg-green-50/50 dark:bg-green-900/20 border-green-400 dark:border-green-500"
+                        : "bg-blue-50/50 dark:bg-blue-900/20 border-blue-400 dark:border-blue-500"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 text-xs mb-1">
+                    {message.taskNotification.status === "failed" ? (
+                      <svg
+                        className="w-4 h-4 text-red-500 dark:text-red-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                      </svg>
+                    ) : message.taskNotification.status === "completed" ? (
+                      <svg
+                        className="w-4 h-4 text-green-500 dark:text-green-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                      </svg>
+                    ) : (
+                      <svg
+                        className="w-4 h-4 text-blue-500 dark:text-blue-400"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                        />
+                      </svg>
+                    )}
+                    <span
+                      className={`font-medium ${
+                        message.taskNotification.status === "failed"
+                          ? "text-red-700 dark:text-red-300"
+                          : message.taskNotification.status === "completed"
+                            ? "text-green-700 dark:text-green-300"
+                            : "text-blue-700 dark:text-blue-300"
+                      }`}
+                    >
+                      Task {message.taskNotification.status}
+                    </span>
+                    <span className="text-gray-500 dark:text-gray-400 font-mono">
+                      #{message.taskNotification.taskId}
+                    </span>
+                  </div>
+                  <p className="text-sm text-gray-700 dark:text-gray-300">
+                    {message.taskNotification.summary}
+                  </p>
+                  {message.taskNotification.outputFile && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 font-mono truncate">
+                      Output: {message.taskNotification.outputFile}
+                    </p>
+                  )}
+                </div>
               ) : message.isThinking ? (
                 /* Thinking messages - collapsible by default */
                 <div className="text-sm text-gray-700 dark:text-gray-300">
@@ -3713,6 +3817,13 @@ function ChatInterface({
         // Extract slash command from skill content to show as user message
         let displayContent = content;
         let isSlashCommand = false;
+        let taskNotification = null;
+
+        // Check for task notification
+        if (trimmedContent.includes("<task-notification>")) {
+          taskNotification = parseTaskNotification(trimmedContent);
+        }
+
         if (isCommandContent) {
           // Try to extract the slash command name from skill content
           const commandMatch = trimmedContent.match(
@@ -3726,7 +3837,7 @@ function ChatInterface({
 
         const shouldSkip =
           !trimmedContent ||
-          (isCommandContent && !isSlashCommand) ||
+          (isCommandContent && !isSlashCommand && !taskNotification) ||
           trimmedContent.startsWith("Caveat:") ||
           trimmedContent.startsWith(
             "This session is being continued from a previous",
@@ -3734,15 +3845,19 @@ function ChatInterface({
           trimmedContent.startsWith("[Request interrupted");
 
         if (!shouldSkip) {
-          // Unescape with math formula protection (unless it's a slash command)
-          if (!isSlashCommand) {
+          // Unescape with math formula protection (unless it's a slash command or task notification)
+          if (!isSlashCommand && !taskNotification) {
             displayContent = unescapeWithMathProtection(displayContent);
           }
           converted.push({
             type: messageType,
-            content: displayContent,
+            content: taskNotification
+              ? taskNotification.summary
+              : displayContent,
             timestamp: msg.timestamp || new Date().toISOString(),
             isSlashCommand,
+            isTaskNotification: !!taskNotification,
+            taskNotification,
           });
         }
       }
@@ -4538,6 +4653,13 @@ function ChatInterface({
                 const last = updated[updated.length - 1];
                 if (last && last.type === "assistant" && last.isStreaming) {
                   last.isStreaming = false;
+                  // Check for task notification in completed message
+                  const taskNotif = parseTaskNotification(last.content);
+                  if (taskNotif) {
+                    last.isTaskNotification = true;
+                    last.taskNotification = taskNotif;
+                    last.content = taskNotif.summary;
+                  }
                 }
                 return updated;
               });
