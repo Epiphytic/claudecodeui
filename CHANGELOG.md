@@ -1,3 +1,10 @@
+## [1.2.3](https://github.com/Epiphytic/claudecodeui/compare/v1.2.2...v1.2.3) (2026-01-25)
+
+
+### Bug Fixes
+
+* render task notifications with proper styling instead of raw XML ([72fd164](https://github.com/Epiphytic/claudecodeui/commit/72fd164664e1d6aeb4a0be7c6836d075afc273e2))
+
 ## [1.2.2](https://github.com/Epiphytic/claudecodeui/compare/v1.2.1...v1.2.2) (2026-01-25)
 
 
