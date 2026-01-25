@@ -2536,8 +2536,8 @@ app.get(
 
       // Construct the JSONL file path
       // Claude stores session files in ~/.claude/projects/[encoded-project-path]/[session-id].jsonl
-      // The encoding replaces /, spaces, ~, and _ with -
-      const encodedPath = projectPath.replace(/[\\/:\s~_]/g, "-");
+      // The encoding replaces /, spaces, ~, _, and . with -
+      const encodedPath = projectPath.replace(/[\\/:\s~_.]/g, "-");
       const projectDir = path.join(homeDir, ".claude", "projects", encodedPath);
 
       const jsonlPath = path.join(projectDir, `${safeSessionId}.jsonl`);
