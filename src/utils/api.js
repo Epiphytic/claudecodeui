@@ -47,23 +47,33 @@ export const api = {
   // Protected endpoints
   // config endpoint removed - no longer needed (frontend uses window.location)
   projects: () => authenticatedFetch("/api/projects"),
-  sessionsList: (timeframe = "1w", etag = null) => {
+  sessionsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
       headers["If-None-Match"] = etag;
     }
-    return authenticatedFetch(`/api/sessions/list?timeframe=${timeframe}`, {
-      headers,
-    });
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(
+      `/api/sessions/list?timeframe=${timeframe}`,
+      options,
+    );
   },
-  projectsList: (timeframe = "1w", etag = null) => {
+  projectsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
       headers["If-None-Match"] = etag;
     }
-    return authenticatedFetch(`/api/projects/list?timeframe=${timeframe}`, {
-      headers,
-    });
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(
+      `/api/projects/list?timeframe=${timeframe}`,
+      options,
+    );
   },
   projectDetail: (projectName) =>
     authenticatedFetch(
