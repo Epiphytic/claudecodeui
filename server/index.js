@@ -86,6 +86,8 @@ import {
   resizeSession as resizeTmuxSession,
 } from "./tmux-manager.js";
 import { detectExternalClaude } from "./external-session-detector.js";
+import { createLogger } from "./logger.js";
+import { startCacheUpdater, CACHE_UPDATE_INTERVAL } from "./process-cache.js";
 import {
   spawnCursor,
   abortCursorSession,
@@ -128,6 +130,9 @@ import {
   authenticateWebSocket,
 } from "./middleware/auth.js";
 import { initializeOrchestrator, StatusValues } from "./orchestrator/index.js";
+
+// Initialize logger for main server
+const log = createLogger("server");
 
 // File system watcher for projects folder
 let projectsWatcher = null;
@@ -690,6 +695,48 @@ app.get("/api/projects", authenticateToken, async (req, res) => {
     const projects = await getProjects();
     res.json(projects);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// External Claude session detection endpoint
+// Returns cached process data, refreshed every 60 seconds
+// Cacheable by clients for up to 60 seconds
+app.get("/api/external-sessions", authenticateToken, async (req, res) => {
+  try {
+    const { projectPath } = req.query;
+
+    // Set cache headers - clients can cache for up to 60 seconds
+    res.setHeader("Cache-Control", "private, max-age=60");
+
+    const result = detectExternalClaude(projectPath || null);
+
+    log.debug(
+      {
+        projectPath,
+        hasExternalSession: result.hasExternalSession,
+        processCount: result.processes.length,
+        cacheAge: result.cacheAge,
+      },
+      "External session check",
+    );
+
+    res.json({
+      hasExternalSession: result.hasExternalSession,
+      detectionAvailable: result.detectionAvailable,
+      detectionError: result.detectionError,
+      cacheAge: result.cacheAge,
+      details: result.hasExternalSession
+        ? {
+            processIds: result.processes.map((p) => p.pid),
+            commands: result.processes.map((p) => p.command),
+            tmuxSessions: result.tmuxSessions.map((s) => s.sessionName),
+            lockFile: result.lockFile.exists ? result.lockFile.lockFile : null,
+          }
+        : null,
+    });
+  } catch (error) {
+    log.error({ error: error.message }, "External session check failed");
     res.status(500).json({ error: error.message });
   }
 });
@@ -1397,26 +1444,28 @@ async function handleChatMessage(ws, writer, messageData) {
     // Handle proactive external session check (before user submits a prompt)
     if (data.type === "check-external-session") {
       const projectPath = data.projectPath;
-      console.log(
-        "[ExternalSessionCheck] Checking for external sessions:",
-        projectPath,
-      );
+      log.debug({ projectPath }, "External session check requested");
       if (projectPath) {
         const externalCheck = detectExternalClaude(projectPath);
-        console.log("[ExternalSessionCheck] Result:", {
-          hasExternalSession: externalCheck.hasExternalSession,
-          detectionAvailable: externalCheck.detectionAvailable,
-          detectionError: externalCheck.detectionError,
-          processCount: externalCheck.processes.length,
-          tmuxCount: externalCheck.tmuxSessions.length,
-          hasLockFile: externalCheck.lockFile.exists,
-        });
+        log.debug(
+          {
+            projectPath,
+            hasExternalSession: externalCheck.hasExternalSession,
+            detectionAvailable: externalCheck.detectionAvailable,
+            detectionError: externalCheck.detectionError,
+            processCount: externalCheck.processes.length,
+            tmuxCount: externalCheck.tmuxSessions.length,
+            hasLockFile: externalCheck.lockFile.exists,
+          },
+          "External session check result",
+        );
         writer.send({
           type: "external-session-check-result",
           projectPath,
           hasExternalSession: externalCheck.hasExternalSession,
           detectionAvailable: externalCheck.detectionAvailable,
           detectionError: externalCheck.detectionError,
+          cacheAge: externalCheck.cacheAge,
           details: externalCheck.hasExternalSession
             ? {
                 processIds: externalCheck.processes.map((p) => p.pid),
@@ -1431,15 +1480,22 @@ async function handleChatMessage(ws, writer, messageData) {
             : null,
         });
       } else {
-        console.log("[ExternalSessionCheck] No projectPath provided");
+        log.debug("External session check: no projectPath provided");
       }
       return;
     }
 
     if (data.type === "claude-command") {
-      console.log("[DEBUG] User message:", data.command || "[Continue/Resume]");
-      console.log("📁 Project:", data.options?.projectPath || "Unknown");
-      console.log("🔄 Session:", data.options?.sessionId ? "Resume" : "New");
+      log.debug(
+        {
+          command: data.command
+            ? data.command.slice(0, 50)
+            : "[Continue/Resume]",
+          project: data.options?.projectPath || "Unknown",
+          sessionMode: data.options?.sessionId ? "Resume" : "New",
+        },
+        "User message received",
+      );
 
       const projectPath = data.options?.projectPath;
       const sessionId = data.options?.sessionId || sessionIdForTracking;
@@ -1468,10 +1524,19 @@ async function handleChatMessage(ws, writer, messageData) {
       if (projectPath) {
         const externalCheck = detectExternalClaude(projectPath);
         if (externalCheck.hasExternalSession) {
+          log.info(
+            {
+              projectPath,
+              processCount: externalCheck.processes.length,
+              tmuxCount: externalCheck.tmuxSessions.length,
+            },
+            "External Claude session detected during chat",
+          );
           writer.send({
             type: "external-session-detected",
             projectPath,
             detectionAvailable: externalCheck.detectionAvailable,
+            cacheAge: externalCheck.cacheAge,
             details: {
               processIds: externalCheck.processes.map((p) => p.pid),
               tmuxSessions: externalCheck.tmuxSessions.map(
@@ -3141,6 +3206,12 @@ async function startServer() {
 
         // Clean up stale tmux session entries on startup
         cleanupStaleTmuxSessions();
+
+        // Start the process cache updater for external session detection
+        startCacheUpdater();
+        console.log(
+          `${c.ok("[OK]")} Process cache started (updates every ${CACHE_UPDATE_INTERVAL / 1000}s)`,
+        );
       } catch (cacheError) {
         console.warn(
           `${c.warn("[WARN]")} Failed to initialize caches: ${cacheError.message}`,

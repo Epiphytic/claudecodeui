@@ -47,6 +47,16 @@ export const api = {
   // Protected endpoints
   // config endpoint removed - no longer needed (frontend uses window.location)
   projects: () => authenticatedFetch("/api/projects"),
+
+  // External session detection - checks for Claude CLI running outside this app
+  // Response is cacheable for 60 seconds
+  externalSessions: (projectPath = null) => {
+    const url = projectPath
+      ? `/api/external-sessions?projectPath=${encodeURIComponent(projectPath)}`
+      : "/api/external-sessions";
+    return authenticatedFetch(url);
+  },
+
   sessionsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
