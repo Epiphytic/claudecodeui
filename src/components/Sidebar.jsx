@@ -82,7 +82,7 @@ function Sidebar({
   updateAvailable,
   latestVersion,
   currentVersion,
-  releaseInfo,
+  packageInfo,
   onShowVersionModal,
   isPWA,
   isMobile,
@@ -1774,7 +1774,7 @@ function Sidebar({
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-medium text-blue-700 dark:text-blue-300">
-                    {releaseInfo?.title || `Version ${latestVersion}`}
+                    {`Version ${latestVersion}`}
                   </div>
                   <div className="text-xs text-blue-600 dark:text-blue-400">
                     Update available
@@ -1807,7 +1807,7 @@ function Sidebar({
                 </div>
                 <div className="min-w-0 flex-1 text-left">
                   <div className="text-sm font-medium text-blue-700 dark:text-blue-300">
-                    {releaseInfo?.title || `Version ${latestVersion}`}
+                    {`Version ${latestVersion}`}
                   </div>
                   <div className="text-xs text-blue-600 dark:text-blue-400">
                     Update available

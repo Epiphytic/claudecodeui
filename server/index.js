@@ -589,7 +589,7 @@ app.get(
   },
 );
 
-// Get messages for a specific session
+// Get messages for a specific session with ETag caching support
 app.get(
   "/api/projects/:projectName/sessions/:sessionId/messages",
   authenticateToken,
@@ -608,6 +608,27 @@ app.get(
         parsedLimit,
         parsedOffset,
       );
+
+      // Generate ETag based on message count and last timestamp
+      const messages = Array.isArray(result) ? result : result.messages || [];
+      const total = Array.isArray(result) ? messages.length : result.total || 0;
+      const lastTimestamp =
+        messages.length > 0
+          ? messages[messages.length - 1]?.timestamp || ""
+          : "";
+      const currentETag = `"${sessionId}-${total}-${Buffer.from(lastTimestamp).toString("base64").slice(0, 16)}"`;
+
+      // Check If-None-Match header for conditional request
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers
+      res.set({
+        "Cache-Control": "private, max-age=5",
+        ETag: currentETag,
+      });
 
       // Handle both old and new response formats
       if (Array.isArray(result)) {
@@ -1125,6 +1146,32 @@ async function handleChatMessage(ws, writer, messageData) {
       typeof messageData === "string" ? JSON.parse(messageData) : messageData;
     const sessionIdForTracking =
       data.options?.sessionId || data.sessionId || `session-${Date.now()}`;
+
+    // Handle proactive external session check (before user submits a prompt)
+    if (data.type === "check-external-session") {
+      const projectPath = data.projectPath;
+      if (projectPath) {
+        const externalCheck = detectExternalClaude(projectPath);
+        writer.send({
+          type: "external-session-check-result",
+          projectPath,
+          hasExternalSession: externalCheck.hasExternalSession,
+          details: externalCheck.hasExternalSession
+            ? {
+                processIds: externalCheck.processes.map((p) => p.pid),
+                commands: externalCheck.processes.map((p) => p.command),
+                tmuxSessions: externalCheck.tmuxSessions.map(
+                  (s) => s.sessionName,
+                ),
+                lockFile: externalCheck.lockFile.exists
+                  ? externalCheck.lockFile.lockFile
+                  : null,
+              }
+            : null,
+        });
+      }
+      return;
+    }
 
     if (data.type === "claude-command") {
       console.log("[DEBUG] User message:", data.command || "[Continue/Resume]");
@@ -2389,6 +2436,9 @@ app.get(
     try {
       const { projectName, sessionId } = req.params;
       const { provider = "claude" } = req.query;
+      console.log(
+        `[TOKEN-USAGE] Request for project: ${projectName}, session: ${sessionId}, provider: ${provider}`,
+      );
       const homeDir = os.homedir();
 
       // Allow only safe characters in sessionId
@@ -2507,8 +2557,8 @@ app.get(
 
       // Construct the JSONL file path
       // Claude stores session files in ~/.claude/projects/[encoded-project-path]/[session-id].jsonl
-      // The encoding replaces /, spaces, ~, and _ with -
-      const encodedPath = projectPath.replace(/[\\/:\s~_]/g, "-");
+      // The encoding replaces /, spaces, ~, _, and . with -
+      const encodedPath = projectPath.replace(/[\\/:\s~_.]/g, "-");
       const projectDir = path.join(homeDir, ".claude", "projects", encodedPath);
 
       const jsonlPath = path.join(projectDir, `${safeSessionId}.jsonl`);
@@ -2528,9 +2578,22 @@ app.get(
         fileContent = await fsPromises.readFile(jsonlPath, "utf8");
       } catch (error) {
         if (error.code === "ENOENT") {
-          return res
-            .status(404)
-            .json({ error: "Session file not found", path: jsonlPath });
+          // Session file doesn't exist yet (new session with no messages)
+          // Return zero token usage instead of 404
+          const parsedContextWindow = parseInt(process.env.CONTEXT_WINDOW, 10);
+          const contextWindow = Number.isFinite(parsedContextWindow)
+            ? parsedContextWindow
+            : 160000;
+          return res.json({
+            used: 0,
+            total: contextWindow,
+            breakdown: {
+              input: 0,
+              cacheCreation: 0,
+              cacheRead: 0,
+            },
+            newSession: true,
+          });
         }
         throw error; // Re-throw other errors to be caught by outer try-catch
       }

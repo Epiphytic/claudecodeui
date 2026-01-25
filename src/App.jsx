@@ -51,8 +51,8 @@ function AppContent() {
   const navigate = useNavigate();
   const { sessionId } = useParams();
 
-  const { updateAvailable, latestVersion, currentVersion, releaseInfo } =
-    useVersionCheck("siteboon", "claudecodeui");
+  const { updateAvailable, latestVersion, currentVersion, packageInfo } =
+    useVersionCheck();
   const [showVersionModal, setShowVersionModal] = useState(false);
 
   const [projects, setProjects] = useState([]);
@@ -62,6 +62,7 @@ function AppContent() {
   const [isMobile, setIsMobile] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
+  const [isProjectSwitching, setIsProjectSwitching] = useState(false);
   const [isInputFocused, setIsInputFocused] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState("agents");
@@ -315,32 +316,13 @@ function AppContent() {
   const fetchProjects = async () => {
     try {
       setIsLoadingProjects(true);
-      const response = await api.projects();
-      const data = await response.json();
-
-      // Always fetch Cursor sessions for each project so we can combine views
-      for (let project of data) {
-        try {
-          const url = `/api/cursor/sessions?projectPath=${encodeURIComponent(project.fullPath || project.path)}`;
-          const cursorResponse = await authenticatedFetch(url);
-          if (cursorResponse.ok) {
-            const cursorData = await cursorResponse.json();
-            if (cursorData.success && cursorData.sessions) {
-              project.cursorSessions = cursorData.sessions;
-            } else {
-              project.cursorSessions = [];
-            }
-          } else {
-            project.cursorSessions = [];
-          }
-        } catch (error) {
-          console.error(
-            `Error fetching Cursor sessions for project ${project.name}:`,
-            error,
-          );
-          project.cursorSessions = [];
-        }
+      // Use the cached projectsList endpoint instead of the heavy projects endpoint
+      const response = await api.projectsList("all");
+      if (!response.ok) {
+        throw new Error(`Failed to fetch projects: ${response.status}`);
       }
+      const result = await response.json();
+      const data = result.projects || [];
 
       // Optimize to preserve object references when data hasn't changed
       setProjects((prevProjects) => {
@@ -360,12 +342,10 @@ function AppContent() {
               newProject.name !== prevProject.name ||
               newProject.displayName !== prevProject.displayName ||
               newProject.fullPath !== prevProject.fullPath ||
+              newProject.sessionCount !== prevProject.sessionCount ||
+              newProject.lastActivity !== prevProject.lastActivity ||
               JSON.stringify(newProject.sessionMeta) !==
-                JSON.stringify(prevProject.sessionMeta) ||
-              JSON.stringify(newProject.sessions) !==
-                JSON.stringify(prevProject.sessions) ||
-              JSON.stringify(newProject.cursorSessions) !==
-                JSON.stringify(prevProject.cursorSessions)
+                JSON.stringify(prevProject.sessionMeta)
             );
           }) || data.length !== prevProjects.length;
 
@@ -392,43 +372,54 @@ function AppContent() {
 
   // Handle URL-based session loading
   useEffect(() => {
-    if (sessionId && projects.length > 0) {
+    const loadSessionFromUrl = async () => {
+      if (!sessionId || projects.length === 0) return;
+
       // Only switch tabs on initial load, not on every project update
       const shouldSwitchTab =
         !selectedSession || selectedSession.id !== sessionId;
-      // Find the session across all projects
-      for (const project of projects) {
-        let session = project.sessions?.find((s) => s.id === sessionId);
-        if (session) {
-          setSelectedProject(project);
-          setSelectedSession({ ...session, __provider: "claude" });
-          // Only switch to chat tab if we're loading a different session
-          if (shouldSwitchTab) {
-            setActiveTab("chat");
-          }
-          return;
-        }
-        // Also check Cursor sessions
-        const cSession = project.cursorSessions?.find(
-          (s) => s.id === sessionId,
-        );
-        if (cSession) {
-          setSelectedProject(project);
-          setSelectedSession({ ...cSession, __provider: "cursor" });
-          if (shouldSwitchTab) {
-            setActiveTab("chat");
-          }
-          return;
-        }
-      }
 
-      // If session not found, it might be a newly created session
-      // Just navigate to it and it will be found when the sidebar refreshes
-      // Don't redirect to home, let the session load naturally
-    }
-  }, [sessionId, projects, navigate]);
+      // Fetch sessions from the cached endpoint to find the session
+      try {
+        const response = await api.sessionsList("all");
+        if (!response.ok) return;
+
+        const result = await response.json();
+        const sessions = result.sessions || [];
+
+        // Find the session by ID
+        const session = sessions.find((s) => s.id === sessionId);
+        if (session) {
+          // Find the corresponding project
+          const project = projects.find(
+            (p) => p.name === session.project?.name,
+          );
+          if (project) {
+            setSelectedProject(project);
+            setSelectedSession({
+              ...session,
+              __provider: session.provider || "claude",
+            });
+            if (shouldSwitchTab) {
+              setActiveTab("chat");
+            }
+          }
+        }
+        // If session not found, it might be a newly created session
+        // Just navigate to it and it will be found when the sidebar refreshes
+      } catch (error) {
+        console.error("Error loading session from URL:", error);
+      }
+    };
+
+    loadSessionFromUrl();
+  }, [sessionId, projects]);
 
   const handleProjectSelect = (project) => {
+    // Don't show loading if selecting the same project
+    if (project?.name !== selectedProject?.name) {
+      setIsProjectSwitching(true);
+    }
     setSelectedProject(project);
     setSelectedSession(null);
     navigate("/");
@@ -484,12 +475,12 @@ function AppContent() {
       navigate("/");
     }
 
-    // Update projects state locally instead of full refresh
+    // Update projects state locally - decrement session count
+    // The Sidebar's useSessionsList will handle updating its own session list
     setProjects((prevProjects) =>
       prevProjects.map((project) => ({
         ...project,
-        sessions:
-          project.sessions?.filter((session) => session.id !== sessionId) || [],
+        sessionCount: Math.max(0, (project.sessionCount || 0) - 1),
         sessionMeta: {
           ...project.sessionMeta,
           total: Math.max(0, (project.sessionMeta?.total || 0) - 1),
@@ -499,10 +490,14 @@ function AppContent() {
   };
 
   const handleSidebarRefresh = async () => {
-    // Refresh only the sessions for all projects, don't change selected state
+    // Refresh projects using the cached endpoint
     try {
-      const response = await api.projects();
-      const freshProjects = await response.json();
+      const response = await api.projectsList("all");
+      if (!response.ok) {
+        throw new Error(`Failed to refresh projects: ${response.status}`);
+      }
+      const result = await response.json();
+      const freshProjects = result.projects || [];
 
       // Optimize to preserve object references and minimize re-renders
       setProjects((prevProjects) => {
@@ -516,10 +511,10 @@ function AppContent() {
               newProject.name !== prevProject.name ||
               newProject.displayName !== prevProject.displayName ||
               newProject.fullPath !== prevProject.fullPath ||
+              newProject.sessionCount !== prevProject.sessionCount ||
+              newProject.lastActivity !== prevProject.lastActivity ||
               JSON.stringify(newProject.sessionMeta) !==
-                JSON.stringify(prevProject.sessionMeta) ||
-              JSON.stringify(newProject.sessions) !==
-                JSON.stringify(prevProject.sessions)
+                JSON.stringify(prevProject.sessionMeta)
             );
           }) || freshProjects.length !== prevProjects.length;
 
@@ -740,7 +735,7 @@ function AppContent() {
                   Update Available
                 </h2>
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                  {releaseInfo?.title || "A new version is ready"}
+                  A new version is ready
                 </p>
               </div>
             </div>
@@ -784,44 +779,33 @@ function AppContent() {
             </div>
           </div>
 
-          {/* Changelog */}
-          {releaseInfo?.body && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-medium text-gray-900 dark:text-white">
-                  What's New:
-                </h3>
-                {releaseInfo?.htmlUrl && (
-                  <a
-                    href={releaseInfo.htmlUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline flex items-center gap-1"
-                  >
-                    View full release
-                    <svg
-                      className="w-3 h-3"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
-                      />
-                    </svg>
-                  </a>
-                )}
-              </div>
-              <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4 border border-gray-200 dark:border-gray-600 max-h-64 overflow-y-auto">
-                <div className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap prose prose-sm dark:prose-invert max-w-none">
-                  {cleanChangelog(releaseInfo.body)}
-                </div>
-              </div>
-            </div>
-          )}
+          {/* Package Link */}
+          <div className="space-y-3">
+            <a
+              href={
+                packageInfo?.homepage ||
+                "https://www.npmjs.com/package/@epiphytic/claudecodeui"
+              }
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline flex items-center gap-1"
+            >
+              View on npm
+              <svg
+                className="w-3 h-3"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
+                />
+              </svg>
+            </a>
+          </div>
 
           {/* Update Output */}
           {updateOutput && (
@@ -922,7 +906,7 @@ function AppContent() {
                 updateAvailable={updateAvailable}
                 latestVersion={latestVersion}
                 currentVersion={currentVersion}
-                releaseInfo={releaseInfo}
+                packageInfo={packageInfo}
                 onShowVersionModal={() => setShowVersionModal(true)}
                 isPWA={isPWA}
                 isMobile={isMobile}
@@ -1023,7 +1007,7 @@ function AppContent() {
               updateAvailable={updateAvailable}
               latestVersion={latestVersion}
               currentVersion={currentVersion}
-              releaseInfo={releaseInfo}
+              packageInfo={packageInfo}
               onShowVersionModal={() => setShowVersionModal(true)}
               isPWA={isPWA}
               isMobile={isMobile}
@@ -1049,6 +1033,8 @@ function AppContent() {
           isPWA={isPWA}
           onMenuClick={() => setSidebarOpen(true)}
           isLoading={isLoadingProjects}
+          isProjectSwitching={isProjectSwitching}
+          onProjectReady={() => setIsProjectSwitching(false)}
           onInputFocusChange={setIsInputFocused}
           onSessionActive={markSessionAsActive}
           onSessionInactive={markSessionAsInactive}

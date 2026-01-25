@@ -47,23 +47,33 @@ export const api = {
   // Protected endpoints
   // config endpoint removed - no longer needed (frontend uses window.location)
   projects: () => authenticatedFetch("/api/projects"),
-  sessionsList: (timeframe = "1w", etag = null) => {
+  sessionsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
       headers["If-None-Match"] = etag;
     }
-    return authenticatedFetch(`/api/sessions/list?timeframe=${timeframe}`, {
-      headers,
-    });
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(
+      `/api/sessions/list?timeframe=${timeframe}`,
+      options,
+    );
   },
-  projectsList: (timeframe = "1w", etag = null) => {
+  projectsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
       headers["If-None-Match"] = etag;
     }
-    return authenticatedFetch(`/api/projects/list?timeframe=${timeframe}`, {
-      headers,
-    });
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(
+      `/api/projects/list?timeframe=${timeframe}`,
+      options,
+    );
   },
   projectDetail: (projectName) =>
     authenticatedFetch(
@@ -71,7 +81,7 @@ export const api = {
     ),
   sessions: (projectName, limit = 5, offset = 0) =>
     authenticatedFetch(
-      `/api/projects/${projectName}/sessions?limit=${limit}&offset=${offset}`,
+      `/api/projects/${encodeURIComponent(projectName)}/sessions?limit=${limit}&offset=${offset}`,
     ),
   sessionMessages: (
     projectName,
@@ -79,6 +89,8 @@ export const api = {
     limit = null,
     offset = 0,
     provider = "claude",
+    etag = null,
+    signal = null,
   ) => {
     const params = new URLSearchParams();
     if (limit !== null) {
@@ -94,25 +106,40 @@ export const api = {
     } else if (provider === "cursor") {
       url = `/api/cursor/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`;
     } else {
-      url = `/api/projects/${projectName}/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`;
+      url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages${queryString ? `?${queryString}` : ""}`;
     }
-    return authenticatedFetch(url);
+
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
   },
   renameProject: (projectName, displayName) =>
-    authenticatedFetch(`/api/projects/${projectName}/rename`, {
-      method: "PUT",
-      body: JSON.stringify({ displayName }),
-    }),
+    authenticatedFetch(
+      `/api/projects/${encodeURIComponent(projectName)}/rename`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ displayName }),
+      },
+    ),
   deleteSession: (projectName, sessionId) =>
-    authenticatedFetch(`/api/projects/${projectName}/sessions/${sessionId}`, {
-      method: "DELETE",
-    }),
+    authenticatedFetch(
+      `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "DELETE",
+      },
+    ),
   deleteCodexSession: (sessionId) =>
     authenticatedFetch(`/api/codex/sessions/${sessionId}`, {
       method: "DELETE",
     }),
   deleteProject: (projectName) =>
-    authenticatedFetch(`/api/projects/${projectName}`, {
+    authenticatedFetch(`/api/projects/${encodeURIComponent(projectName)}`, {
       method: "DELETE",
     }),
   createProject: (path) =>

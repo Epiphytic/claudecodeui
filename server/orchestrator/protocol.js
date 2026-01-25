@@ -17,6 +17,8 @@ export const OutboundMessageTypes = {
   RESPONSE_COMPLETE: "response_complete",
   ERROR: "error",
   HTTP_PROXY_RESPONSE: "http_proxy_response",
+  // Pending mode messages
+  PENDING_REGISTER: "pending_register",
 };
 
 /**
@@ -30,6 +32,11 @@ export const InboundMessageTypes = {
   USER_REQUEST: "user_request",
   USER_REQUEST_FOLLOW_UP: "user_request_follow_up",
   HTTP_PROXY_REQUEST: "http_proxy_request",
+  // Pending mode responses
+  PENDING_REGISTERED: "pending_registered",
+  TOKEN_GRANTED: "token_granted",
+  AUTHORIZATION_DENIED: "authorization_denied",
+  AUTHORIZATION_TIMEOUT: "authorization_timeout",
 };
 
 /**
@@ -94,6 +101,29 @@ export function createPingMessage(clientId) {
   return {
     type: OutboundMessageTypes.PING,
     client_id: clientId,
+  };
+}
+
+/**
+ * Creates a pending register message for pending mode
+ * @param {string} pendingId - Unique pending client identifier
+ * @param {string} hostname - Machine hostname
+ * @param {string} project - Current project/working directory
+ * @param {string} platform - Operating system platform
+ * @returns {Object} Pending register message
+ */
+export function createPendingRegisterMessage(
+  pendingId,
+  hostname,
+  project,
+  platform,
+) {
+  return {
+    type: OutboundMessageTypes.PENDING_REGISTER,
+    pending_id: pendingId,
+    hostname,
+    project,
+    platform,
   };
 }
 
@@ -253,6 +283,43 @@ export function validateInboundMessage(message) {
         typeof message.method === "string" &&
         typeof message.path === "string"
       );
+
+    case InboundMessageTypes.PENDING_REGISTERED:
+      // pending_registered message structure:
+      // {
+      //   type: "pending_registered",
+      //   success: boolean,
+      //   message?: string
+      // }
+      return typeof message.success === "boolean";
+
+    case InboundMessageTypes.TOKEN_GRANTED:
+      // token_granted message structure:
+      // {
+      //   type: "token_granted",
+      //   token: string,     // Full token: "ao_xxx_yyy"
+      //   client_id: string  // Assigned client ID
+      // }
+      return (
+        typeof message.token === "string" &&
+        typeof message.client_id === "string"
+      );
+
+    case InboundMessageTypes.AUTHORIZATION_DENIED:
+      // authorization_denied message structure:
+      // {
+      //   type: "authorization_denied",
+      //   reason: string
+      // }
+      return typeof message.reason === "string";
+
+    case InboundMessageTypes.AUTHORIZATION_TIMEOUT:
+      // authorization_timeout message structure:
+      // {
+      //   type: "authorization_timeout",
+      //   message: string
+      // }
+      return typeof message.message === "string";
 
     default:
       // Unknown message types are considered valid (forward compatibility)

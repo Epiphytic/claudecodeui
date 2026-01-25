@@ -1134,7 +1134,8 @@ async function addProjectManually(projectPath, displayName = null) {
   }
 
   // Generate project name (encode path for use as directory name)
-  const projectName = absolutePath.replace(/\//g, "-");
+  // Claude's encoding replaces /, :, spaces, ~, _, and . with -
+  const projectName = absolutePath.replace(/[\\/:\s~_.]/g, "-");
 
   // Check if project already exists in config
   const config = await loadProjectConfig();

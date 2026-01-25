@@ -66,3 +66,15 @@ CREATE TABLE IF NOT EXISTS tmux_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_tmux_sessions_project ON tmux_sessions(project_path);
 CREATE INDEX IF NOT EXISTS idx_tmux_sessions_name ON tmux_sessions(tmux_session_name);
+
+-- Orchestrator tokens table for storing tokens received from orchestrator during pending mode
+CREATE TABLE IF NOT EXISTS orchestrator_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL UNIQUE,          -- e.g., "duratii.example.com"
+    token TEXT NOT NULL,                 -- Full token string (ao_xxx_yyy)
+    client_id TEXT,                      -- Client ID assigned by orchestrator
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_tokens_host ON orchestrator_tokens(host);

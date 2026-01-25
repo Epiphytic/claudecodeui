@@ -18,6 +18,7 @@ export {
   createRegisterMessage,
   createStatusUpdateMessage,
   createPingMessage,
+  createPendingRegisterMessage,
   createResponseMessage,
   createResponseChunkMessage,
   createResponseCompleteMessage,
@@ -61,6 +62,11 @@ export {
 /**
  * Creates and configures an orchestrator client from environment variables
  *
+ * Token Precedence:
+ * 1. .env file ORCHESTRATOR_TOKEN - Highest priority, always used if set
+ * 2. Database token for specific host - Used when .env token is empty/missing
+ * 3. No token available - Uses pending mode with claim patterns
+ *
  * @param {Object} [overrides] - Configuration overrides
  * @returns {Promise<OrchestratorClient|null>} Configured client or null if not in client mode
  */
@@ -74,7 +80,6 @@ export async function createOrchestratorClientFromEnv(overrides = {}) {
   }
 
   const url = overrides.url || process.env.ORCHESTRATOR_URL;
-  const token = overrides.token || process.env.ORCHESTRATOR_TOKEN;
 
   if (!url) {
     console.warn(
@@ -83,16 +88,46 @@ export async function createOrchestratorClientFromEnv(overrides = {}) {
     return null;
   }
 
-  if (!token) {
+  // Token is now optional - if not set, pending mode will be used
+  const token = overrides.token || process.env.ORCHESTRATOR_TOKEN || null;
+
+  // Build claim patterns for pending mode
+  // Fall back to ORCHESTRATOR_GITHUB_* variables if ORCHESTRATOR_CLAIM_* not set
+  const claimPatterns = overrides.claimPatterns || {
+    user:
+      process.env.ORCHESTRATOR_CLAIM_USER ||
+      process.env.ORCHESTRATOR_GITHUB_USERS ||
+      "",
+    org:
+      process.env.ORCHESTRATOR_CLAIM_ORG ||
+      process.env.ORCHESTRATOR_GITHUB_ORG ||
+      "",
+    team:
+      process.env.ORCHESTRATOR_CLAIM_TEAM ||
+      process.env.ORCHESTRATOR_GITHUB_TEAM ||
+      "",
+  };
+
+  // Validate: need either a token or at least one claim pattern
+  const hasToken = token && token.trim() !== "";
+  const hasClaimPattern =
+    (claimPatterns.user && claimPatterns.user.trim()) ||
+    (claimPatterns.org && claimPatterns.org.trim()) ||
+    (claimPatterns.team && claimPatterns.team.trim());
+
+  if (!hasToken && !hasClaimPattern) {
     console.warn(
-      "[ORCHESTRATOR] ORCHESTRATOR_TOKEN not set, running in standalone mode",
+      "[ORCHESTRATOR] No token and no claim patterns set, running in standalone mode",
+    );
+    console.warn(
+      "[ORCHESTRATOR] Set ORCHESTRATOR_TOKEN or at least one of ORCHESTRATOR_CLAIM_USER, ORCHESTRATOR_CLAIM_ORG, ORCHESTRATOR_CLAIM_TEAM",
     );
     return null;
   }
 
   const config = {
     url,
-    token,
+    token: hasToken ? token : null,
     clientId: overrides.clientId || process.env.ORCHESTRATOR_CLIENT_ID,
     reconnectInterval:
       overrides.reconnectInterval ||
@@ -103,6 +138,7 @@ export async function createOrchestratorClientFromEnv(overrides = {}) {
       parseInt(process.env.ORCHESTRATOR_HEARTBEAT_INTERVAL) ||
       30000,
     metadata: overrides.metadata || {},
+    claimPatterns,
   };
 
   return new OrchestratorClient(config);
@@ -116,6 +152,11 @@ export async function createOrchestratorClientFromEnv(overrides = {}) {
  * 2. Sets up status tracking hooks
  * 3. Connects to the orchestrator
  * 4. Sets up user request handling
+ *
+ * Token Precedence:
+ * 1. .env file ORCHESTRATOR_TOKEN - Highest priority, always used if set
+ * 2. Database token for specific host - Used when .env token is empty/missing
+ * 3. No token available - Uses pending mode with claim patterns
  *
  * @param {Object} options - Initialization options
  * @param {Object} options.handlers - Handler functions for proxied requests
@@ -138,11 +179,44 @@ export async function initializeOrchestrator(options = {}) {
   }
 
   const url = config.url || process.env.ORCHESTRATOR_URL;
-  const token = config.token || process.env.ORCHESTRATOR_TOKEN;
 
-  if (!url || !token) {
+  if (!url) {
     console.warn(
-      "[ORCHESTRATOR] URL or token not configured, running in standalone mode",
+      "[ORCHESTRATOR] URL not configured, running in standalone mode",
+    );
+    return null;
+  }
+
+  // Token is now optional - if not set, pending mode will be used
+  const token = config.token || process.env.ORCHESTRATOR_TOKEN || null;
+
+  // Build claim patterns for pending mode
+  // Fall back to ORCHESTRATOR_GITHUB_* variables if ORCHESTRATOR_CLAIM_* not set
+  const claimPatterns = config.claimPatterns || {
+    user:
+      process.env.ORCHESTRATOR_CLAIM_USER ||
+      process.env.ORCHESTRATOR_GITHUB_USERS ||
+      "",
+    org:
+      process.env.ORCHESTRATOR_CLAIM_ORG ||
+      process.env.ORCHESTRATOR_GITHUB_ORG ||
+      "",
+    team:
+      process.env.ORCHESTRATOR_CLAIM_TEAM ||
+      process.env.ORCHESTRATOR_GITHUB_TEAM ||
+      "",
+  };
+
+  // Validate: need either a token or at least one claim pattern
+  const hasToken = token && token.trim() !== "";
+  const hasClaimPattern =
+    (claimPatterns.user && claimPatterns.user.trim()) ||
+    (claimPatterns.org && claimPatterns.org.trim()) ||
+    (claimPatterns.team && claimPatterns.team.trim());
+
+  if (!hasToken && !hasClaimPattern) {
+    console.warn(
+      "[ORCHESTRATOR] No token and no claim patterns set, running in standalone mode",
     );
     return null;
   }
@@ -155,7 +229,7 @@ export async function initializeOrchestrator(options = {}) {
   // Create client
   const client = new OrchestratorClient({
     url,
-    token,
+    token: hasToken ? token : null,
     clientId: config.clientId || process.env.ORCHESTRATOR_CLIENT_ID,
     reconnectInterval:
       config.reconnectInterval ||
@@ -167,6 +241,7 @@ export async function initializeOrchestrator(options = {}) {
       30000,
     metadata: config.metadata || {},
     callbackUrl,
+    claimPatterns,
   });
 
   // Create status hooks
