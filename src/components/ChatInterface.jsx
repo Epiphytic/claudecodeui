@@ -2819,6 +2819,7 @@ function ChatInterface({
   const messageListCacheRef = useRef(null); // { messages: [], total: number, etag: string }
   const messageBodiesCacheRef = useRef(new Map()); // Map<number, message>
   const lastKnownMessageNumberRef = useRef(0);
+  const oldestLoadedMessageRef = useRef(0); // Track oldest loaded message for lazy loading
   const messageListLastFetchedRef = useRef(0); // Timestamp of last list fetch
   const messagePollingRef = useRef(null); // Polling timer reference
   const listPollingRef = useRef(null); // List backup polling timer
@@ -2829,6 +2830,8 @@ function ChatInterface({
   const LIST_POLL_INITIAL = 60 * 1000; // 1 minute initial
   const LIST_POLL_MAX = 60 * 60 * 1000; // 1 hour max
   const BACKOFF_MULTIPLIER = 1.5;
+  const MESSAGE_LIST_BACKUP_INTERVAL = 5 * 60 * 1000; // 5 minutes backup interval
+  const INITIAL_MESSAGE_COUNT = 100; // Only load last 100 messages initially
 
   const [messagePollInterval, setMessagePollInterval] =
     useState(MESSAGE_POLL_INITIAL);
@@ -3465,12 +3468,32 @@ function ChatInterface({
         messageListLastFetchedRef.current = now;
 
         setTotalMessages(listData.total);
-        setHasMoreMessages(false); // Using new system, no pagination
 
         // Step 2: Determine which messages to fetch
-        const messageNumbers = listData.messages.map((m) => m.number);
+        const allMessageNumbers = listData.messages.map((m) => m.number);
         const cachedBodies = messageBodiesCacheRef.current;
-        const missingNumbers = messageNumbers.filter(
+
+        // On initial load, only fetch the last INITIAL_MESSAGE_COUNT messages
+        // On loadMore (handled by loadOlderMessages), this function won't be called
+        let messageNumbersToLoad;
+        if (isInitialLoad && allMessageNumbers.length > INITIAL_MESSAGE_COUNT) {
+          // Only load the last 100 messages
+          messageNumbersToLoad = allMessageNumbers.slice(
+            -INITIAL_MESSAGE_COUNT,
+          );
+          setHasMoreMessages(true);
+          // Track the oldest message we're loading
+          oldestLoadedMessageRef.current = Math.min(...messageNumbersToLoad);
+        } else {
+          // Load all messages (small session or loadMore request)
+          messageNumbersToLoad = allMessageNumbers;
+          setHasMoreMessages(false);
+          if (allMessageNumbers.length > 0) {
+            oldestLoadedMessageRef.current = Math.min(...allMessageNumbers);
+          }
+        }
+
+        const missingNumbers = messageNumbersToLoad.filter(
           (n) => !cachedBodies.has(n),
         );
 
@@ -3499,14 +3522,17 @@ function ChatInterface({
         }
 
         // Update last known message number
-        if (messageNumbers.length > 0) {
-          lastKnownMessageNumberRef.current = Math.max(...messageNumbers);
+        if (allMessageNumbers.length > 0) {
+          lastKnownMessageNumberRef.current = Math.max(...allMessageNumbers);
         }
 
-        // Build ordered message array from cache
+        // Build ordered message array from cache (only loaded messages)
         const messages = [];
         for (const m of listData.messages) {
-          if (cachedBodies.has(m.number)) {
+          if (
+            cachedBodies.has(m.number) &&
+            messageNumbersToLoad.includes(m.number)
+          ) {
             messages.push(cachedBodies.get(m.number));
           }
         }
@@ -4247,10 +4273,68 @@ function ChatInterface({
       if (sessionProvider === "cursor") return false;
 
       isLoadingMoreRef.current = true;
+      setIsLoadingMoreMessages(true);
       const previousScrollHeight = container.scrollHeight;
       const previousScrollTop = container.scrollTop;
 
       try {
+        // For Claude, use range endpoint directly for efficiency
+        if (sessionProvider === "claude") {
+          const currentOldest = oldestLoadedMessageRef.current;
+          if (currentOldest <= 1) {
+            // No more messages to load
+            setHasMoreMessages(false);
+            return false;
+          }
+
+          // Calculate range: load INITIAL_MESSAGE_COUNT messages before the current oldest
+          const endNum = currentOldest - 1;
+          const startNum = Math.max(1, endNum - INITIAL_MESSAGE_COUNT + 1);
+
+          const rangeResponse = await api.messagesByRange(
+            selectedProject.name,
+            selectedSession.id,
+            startNum,
+            endNum,
+          );
+
+          if (!rangeResponse.ok) {
+            console.error("Failed to load older messages");
+            return false;
+          }
+
+          const rangeData = await rangeResponse.json();
+          const olderMessages = rangeData.messages || [];
+
+          if (olderMessages.length > 0) {
+            // Cache the fetched messages
+            const cachedBodies = messageBodiesCacheRef.current;
+            for (const msg of olderMessages) {
+              cachedBodies.set(msg.number, msg);
+            }
+
+            // Update oldest loaded message
+            const newOldest = Math.min(...olderMessages.map((m) => m.number));
+            oldestLoadedMessageRef.current = newOldest;
+
+            // Check if there are more messages to load
+            setHasMoreMessages(newOldest > 1);
+
+            // Sort messages by number and prepend
+            olderMessages.sort((a, b) => a.number - b.number);
+            pendingScrollRestoreRef.current = {
+              height: previousScrollHeight,
+              top: previousScrollTop,
+            };
+            setSessionMessages((prev) => [...olderMessages, ...prev]);
+          } else {
+            setHasMoreMessages(false);
+          }
+
+          return true;
+        }
+
+        // For other providers, use the old pagination approach
         const moreMessages = await loadSessionMessages(
           selectedProject.name,
           selectedSession.id,
@@ -4269,6 +4353,7 @@ function ChatInterface({
         return true;
       } finally {
         isLoadingMoreRef.current = false;
+        setIsLoadingMoreMessages(false);
       }
     },
     [
@@ -4335,6 +4420,7 @@ function ChatInterface({
           messageListCacheRef.current = null;
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
+          oldestLoadedMessageRef.current = 0;
           messageListLastFetchedRef.current = 0;
           // Reset polling intervals and locks
           messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
@@ -4376,6 +4462,7 @@ function ChatInterface({
           messageListCacheRef.current = null;
           messageBodiesCacheRef.current = new Map();
           lastKnownMessageNumberRef.current = 0;
+          oldestLoadedMessageRef.current = 0;
           messageListLastFetchedRef.current = 0;
           // Reset polling intervals and locks
           messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
@@ -4464,6 +4551,7 @@ function ChatInterface({
         messageListCacheRef.current = null;
         messageBodiesCacheRef.current = new Map();
         lastKnownMessageNumberRef.current = 0;
+        oldestLoadedMessageRef.current = 0;
         messageListLastFetchedRef.current = 0;
         // Reset polling intervals and locks
         messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
@@ -4654,14 +4742,17 @@ function ChatInterface({
                 }
                 lastKnownMessageNumberRef.current = listData.total;
 
-                // Rebuild messages array
-                const messages = [];
-                for (let i = 1; i <= listData.total; i++) {
+                // Append new messages instead of rebuilding entire array
+                // This preserves lazy loading - only add new messages
+                const newMessages = [];
+                for (let i = currentCount + 1; i <= listData.total; i++) {
                   if (messageBodiesCacheRef.current.has(i)) {
-                    messages.push(messageBodiesCacheRef.current.get(i));
+                    newMessages.push(messageBodiesCacheRef.current.get(i));
                   }
                 }
-                setSessionMessages(messages);
+                if (newMessages.length > 0) {
+                  setSessionMessages((prev) => [...prev, ...newMessages]);
+                }
                 setTotalMessages(listData.total);
 
                 // Reset intervals on new messages
