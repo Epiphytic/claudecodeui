@@ -51,8 +51,8 @@ function AppContent() {
   const navigate = useNavigate();
   const { sessionId } = useParams();
 
-  const { updateAvailable, latestVersion, currentVersion, releaseInfo } =
-    useVersionCheck("siteboon", "claudecodeui");
+  const { updateAvailable, latestVersion, currentVersion, packageInfo } =
+    useVersionCheck();
   const [showVersionModal, setShowVersionModal] = useState(false);
 
   const [projects, setProjects] = useState([]);
@@ -745,7 +745,7 @@ function AppContent() {
                   Update Available
                 </h2>
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                  {releaseInfo?.title || "A new version is ready"}
+                  A new version is ready
                 </p>
               </div>
             </div>
@@ -789,44 +789,33 @@ function AppContent() {
             </div>
           </div>
 
-          {/* Changelog */}
-          {releaseInfo?.body && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-medium text-gray-900 dark:text-white">
-                  What's New:
-                </h3>
-                {releaseInfo?.htmlUrl && (
-                  <a
-                    href={releaseInfo.htmlUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline flex items-center gap-1"
-                  >
-                    View full release
-                    <svg
-                      className="w-3 h-3"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
-                      />
-                    </svg>
-                  </a>
-                )}
-              </div>
-              <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4 border border-gray-200 dark:border-gray-600 max-h-64 overflow-y-auto">
-                <div className="text-sm text-gray-700 dark:text-gray-300 whitespace-pre-wrap prose prose-sm dark:prose-invert max-w-none">
-                  {cleanChangelog(releaseInfo.body)}
-                </div>
-              </div>
-            </div>
-          )}
+          {/* Package Link */}
+          <div className="space-y-3">
+            <a
+              href={
+                packageInfo?.homepage ||
+                "https://www.npmjs.com/package/@epiphytic/claudecodeui"
+              }
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline flex items-center gap-1"
+            >
+              View on npm
+              <svg
+                className="w-3 h-3"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
+                />
+              </svg>
+            </a>
+          </div>
 
           {/* Update Output */}
           {updateOutput && (
@@ -927,7 +916,7 @@ function AppContent() {
                 updateAvailable={updateAvailable}
                 latestVersion={latestVersion}
                 currentVersion={currentVersion}
-                releaseInfo={releaseInfo}
+                packageInfo={packageInfo}
                 onShowVersionModal={() => setShowVersionModal(true)}
                 isPWA={isPWA}
                 isMobile={isMobile}
@@ -1028,7 +1017,7 @@ function AppContent() {
               updateAvailable={updateAvailable}
               latestVersion={latestVersion}
               currentVersion={currentVersion}
-              releaseInfo={releaseInfo}
+              packageInfo={packageInfo}
               onShowVersionModal={() => setShowVersionModal(true)}
               isPWA={isPWA}
               isMobile={isMobile}

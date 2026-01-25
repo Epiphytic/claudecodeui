@@ -1,10 +1,20 @@
-import { useState, useEffect } from 'react';
-import { Button } from './ui/button';
-import { Input } from './ui/input';
-import { Key, Plus, Trash2, Eye, EyeOff, Copy, Check, Github, ExternalLink } from 'lucide-react';
-import { useVersionCheck } from '../hooks/useVersionCheck';
-import { version } from '../../package.json';
-import { authenticatedFetch } from '../utils/api';
+import { useState, useEffect } from "react";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import {
+  Key,
+  Plus,
+  Trash2,
+  Eye,
+  EyeOff,
+  Copy,
+  Check,
+  Github,
+  ExternalLink,
+} from "lucide-react";
+import { useVersionCheck } from "../hooks/useVersionCheck";
+import { version } from "../../package.json";
+import { authenticatedFetch } from "../utils/api";
 
 function CredentialsSettings() {
   const [apiKeys, setApiKeys] = useState([]);
@@ -12,16 +22,16 @@ function CredentialsSettings() {
   const [loading, setLoading] = useState(true);
   const [showNewKeyForm, setShowNewKeyForm] = useState(false);
   const [showNewGithubForm, setShowNewGithubForm] = useState(false);
-  const [newKeyName, setNewKeyName] = useState('');
-  const [newGithubName, setNewGithubName] = useState('');
-  const [newGithubToken, setNewGithubToken] = useState('');
-  const [newGithubDescription, setNewGithubDescription] = useState('');
+  const [newKeyName, setNewKeyName] = useState("");
+  const [newGithubName, setNewGithubName] = useState("");
+  const [newGithubToken, setNewGithubToken] = useState("");
+  const [newGithubDescription, setNewGithubDescription] = useState("");
   const [showToken, setShowToken] = useState({});
   const [copiedKey, setCopiedKey] = useState(null);
   const [newlyCreatedKey, setNewlyCreatedKey] = useState(null);
 
   // Version check hook
-  const { updateAvailable, latestVersion, releaseInfo } = useVersionCheck('siteboon', 'claudecodeui');
+  const { updateAvailable, latestVersion, packageInfo } = useVersionCheck();
 
   useEffect(() => {
     fetchData();
@@ -32,16 +42,18 @@ function CredentialsSettings() {
       setLoading(true);
 
       // Fetch API keys
-      const apiKeysRes = await authenticatedFetch('/api/settings/api-keys');
+      const apiKeysRes = await authenticatedFetch("/api/settings/api-keys");
       const apiKeysData = await apiKeysRes.json();
       setApiKeys(apiKeysData.apiKeys || []);
 
       // Fetch GitHub credentials only
-      const credentialsRes = await authenticatedFetch('/api/settings/credentials?type=github_token');
+      const credentialsRes = await authenticatedFetch(
+        "/api/settings/credentials?type=github_token",
+      );
       const credentialsData = await credentialsRes.json();
       setGithubCredentials(credentialsData.credentials || []);
     } catch (error) {
-      console.error('Error fetching settings:', error);
+      console.error("Error fetching settings:", error);
     } finally {
       setLoading(false);
     }
@@ -51,45 +63,45 @@ function CredentialsSettings() {
     if (!newKeyName.trim()) return;
 
     try {
-      const res = await authenticatedFetch('/api/settings/api-keys', {
-        method: 'POST',
-        body: JSON.stringify({ keyName: newKeyName })
+      const res = await authenticatedFetch("/api/settings/api-keys", {
+        method: "POST",
+        body: JSON.stringify({ keyName: newKeyName }),
       });
 
       const data = await res.json();
       if (data.success) {
         setNewlyCreatedKey(data.apiKey);
-        setNewKeyName('');
+        setNewKeyName("");
         setShowNewKeyForm(false);
         fetchData();
       }
     } catch (error) {
-      console.error('Error creating API key:', error);
+      console.error("Error creating API key:", error);
     }
   };
 
   const deleteApiKey = async (keyId) => {
-    if (!confirm('Are you sure you want to delete this API key?')) return;
+    if (!confirm("Are you sure you want to delete this API key?")) return;
 
     try {
       await authenticatedFetch(`/api/settings/api-keys/${keyId}`, {
-        method: 'DELETE'
+        method: "DELETE",
       });
       fetchData();
     } catch (error) {
-      console.error('Error deleting API key:', error);
+      console.error("Error deleting API key:", error);
     }
   };
 
   const toggleApiKey = async (keyId, isActive) => {
     try {
       await authenticatedFetch(`/api/settings/api-keys/${keyId}/toggle`, {
-        method: 'PATCH',
-        body: JSON.stringify({ isActive: !isActive })
+        method: "PATCH",
+        body: JSON.stringify({ isActive: !isActive }),
       });
       fetchData();
     } catch (error) {
-      console.error('Error toggling API key:', error);
+      console.error("Error toggling API key:", error);
     }
   };
 
@@ -97,51 +109,54 @@ function CredentialsSettings() {
     if (!newGithubName.trim() || !newGithubToken.trim()) return;
 
     try {
-      const res = await authenticatedFetch('/api/settings/credentials', {
-        method: 'POST',
+      const res = await authenticatedFetch("/api/settings/credentials", {
+        method: "POST",
         body: JSON.stringify({
           credentialName: newGithubName,
-          credentialType: 'github_token',
+          credentialType: "github_token",
           credentialValue: newGithubToken,
-          description: newGithubDescription
-        })
+          description: newGithubDescription,
+        }),
       });
 
       const data = await res.json();
       if (data.success) {
-        setNewGithubName('');
-        setNewGithubToken('');
-        setNewGithubDescription('');
+        setNewGithubName("");
+        setNewGithubToken("");
+        setNewGithubDescription("");
         setShowNewGithubForm(false);
         fetchData();
       }
     } catch (error) {
-      console.error('Error creating GitHub credential:', error);
+      console.error("Error creating GitHub credential:", error);
     }
   };
 
   const deleteGithubCredential = async (credentialId) => {
-    if (!confirm('Are you sure you want to delete this GitHub token?')) return;
+    if (!confirm("Are you sure you want to delete this GitHub token?")) return;
 
     try {
       await authenticatedFetch(`/api/settings/credentials/${credentialId}`, {
-        method: 'DELETE'
+        method: "DELETE",
       });
       fetchData();
     } catch (error) {
-      console.error('Error deleting GitHub credential:', error);
+      console.error("Error deleting GitHub credential:", error);
     }
   };
 
   const toggleGithubCredential = async (credentialId, isActive) => {
     try {
-      await authenticatedFetch(`/api/settings/credentials/${credentialId}/toggle`, {
-        method: 'PATCH',
-        body: JSON.stringify({ isActive: !isActive })
-      });
+      await authenticatedFetch(
+        `/api/settings/credentials/${credentialId}/toggle`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ isActive: !isActive }),
+        },
+      );
       fetchData();
     } catch (error) {
-      console.error('Error toggling GitHub credential:', error);
+      console.error("Error toggling GitHub credential:", error);
     }
   };
 
@@ -160,7 +175,9 @@ function CredentialsSettings() {
       {/* New API Key Alert */}
       {newlyCreatedKey && (
         <div className="p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-          <h4 className="font-semibold text-yellow-500 mb-2">⚠️ Save Your API Key</h4>
+          <h4 className="font-semibold text-yellow-500 mb-2">
+            ⚠️ Save Your API Key
+          </h4>
           <p className="text-sm text-muted-foreground mb-3">
             This is the only time you'll see this key. Store it securely.
           </p>
@@ -171,9 +188,13 @@ function CredentialsSettings() {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => copyToClipboard(newlyCreatedKey.apiKey, 'new')}
+              onClick={() => copyToClipboard(newlyCreatedKey.apiKey, "new")}
             >
-              {copiedKey === 'new' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+              {copiedKey === "new" ? (
+                <Check className="h-4 w-4" />
+              ) : (
+                <Copy className="h-4 w-4" />
+              )}
             </Button>
           </div>
           <Button
@@ -194,10 +215,7 @@ function CredentialsSettings() {
             <Key className="h-5 w-5" />
             <h3 className="text-lg font-semibold">API Keys</h3>
           </div>
-          <Button
-            size="sm"
-            onClick={() => setShowNewKeyForm(!showNewKeyForm)}
-          >
+          <Button size="sm" onClick={() => setShowNewKeyForm(!showNewKeyForm)}>
             <Plus className="h-4 w-4 mr-1" />
             New API Key
           </Button>
@@ -205,7 +223,8 @@ function CredentialsSettings() {
 
         <div className="mb-4">
           <p className="text-sm text-muted-foreground mb-2">
-            Generate API keys to access the external API from other applications.
+            Generate API keys to access the external API from other
+            applications.
           </p>
           <a
             href="/api-docs.html"
@@ -228,7 +247,10 @@ function CredentialsSettings() {
             />
             <div className="flex gap-2">
               <Button onClick={createApiKey}>Create</Button>
-              <Button variant="outline" onClick={() => setShowNewKeyForm(false)}>
+              <Button
+                variant="outline"
+                onClick={() => setShowNewKeyForm(false)}
+              >
                 Cancel
               </Button>
             </div>
@@ -237,7 +259,9 @@ function CredentialsSettings() {
 
         <div className="space-y-2">
           {apiKeys.length === 0 ? (
-            <p className="text-sm text-muted-foreground italic">No API keys created yet.</p>
+            <p className="text-sm text-muted-foreground italic">
+              No API keys created yet.
+            </p>
           ) : (
             apiKeys.map((key) => (
               <div
@@ -246,19 +270,22 @@ function CredentialsSettings() {
               >
                 <div className="flex-1">
                   <div className="font-medium">{key.key_name}</div>
-                  <code className="text-xs text-muted-foreground">{key.api_key}</code>
+                  <code className="text-xs text-muted-foreground">
+                    {key.api_key}
+                  </code>
                   <div className="text-xs text-muted-foreground mt-1">
                     Created: {new Date(key.created_at).toLocaleDateString()}
-                    {key.last_used && ` • Last used: ${new Date(key.last_used).toLocaleDateString()}`}
+                    {key.last_used &&
+                      ` • Last used: ${new Date(key.last_used).toLocaleDateString()}`}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
                     size="sm"
-                    variant={key.is_active ? 'outline' : 'secondary'}
+                    variant={key.is_active ? "outline" : "secondary"}
                     onClick={() => toggleApiKey(key.id, key.is_active)}
                   >
-                    {key.is_active ? 'Active' : 'Inactive'}
+                    {key.is_active ? "Active" : "Inactive"}
                   </Button>
                   <Button
                     size="sm"
@@ -291,7 +318,8 @@ function CredentialsSettings() {
         </div>
 
         <p className="text-sm text-muted-foreground mb-4">
-          Add GitHub Personal Access Tokens to clone private repositories. You can also pass tokens directly in API requests without storing them.
+          Add GitHub Personal Access Tokens to clone private repositories. You
+          can also pass tokens directly in API requests without storing them.
         </p>
 
         {showNewGithubForm && (
@@ -304,7 +332,7 @@ function CredentialsSettings() {
 
             <div className="relative">
               <Input
-                type={showToken['new'] ? 'text' : 'password'}
+                type={showToken["new"] ? "text" : "password"}
                 placeholder="GitHub Personal Access Token (ghp_...)"
                 value={newGithubToken}
                 onChange={(e) => setNewGithubToken(e.target.value)}
@@ -312,10 +340,16 @@ function CredentialsSettings() {
               />
               <button
                 type="button"
-                onClick={() => setShowToken({ ...showToken, new: !showToken['new'] })}
+                onClick={() =>
+                  setShowToken({ ...showToken, new: !showToken["new"] })
+                }
                 className="absolute right-3 top-2.5 text-muted-foreground hover:text-foreground"
               >
-                {showToken['new'] ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                {showToken["new"] ? (
+                  <EyeOff className="h-4 w-4" />
+                ) : (
+                  <Eye className="h-4 w-4" />
+                )}
               </button>
             </div>
 
@@ -327,12 +361,15 @@ function CredentialsSettings() {
 
             <div className="flex gap-2">
               <Button onClick={createGithubCredential}>Add Token</Button>
-              <Button variant="outline" onClick={() => {
-                setShowNewGithubForm(false);
-                setNewGithubName('');
-                setNewGithubToken('');
-                setNewGithubDescription('');
-              }}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setShowNewGithubForm(false);
+                  setNewGithubName("");
+                  setNewGithubToken("");
+                  setNewGithubDescription("");
+                }}
+              >
                 Cancel
               </Button>
             </div>
@@ -350,7 +387,9 @@ function CredentialsSettings() {
 
         <div className="space-y-2">
           {githubCredentials.length === 0 ? (
-            <p className="text-sm text-muted-foreground italic">No GitHub tokens added yet.</p>
+            <p className="text-sm text-muted-foreground italic">
+              No GitHub tokens added yet.
+            </p>
           ) : (
             githubCredentials.map((credential) => (
               <div
@@ -358,21 +397,31 @@ function CredentialsSettings() {
                 className="flex items-center justify-between p-3 border rounded-lg"
               >
                 <div className="flex-1">
-                  <div className="font-medium">{credential.credential_name}</div>
+                  <div className="font-medium">
+                    {credential.credential_name}
+                  </div>
                   {credential.description && (
-                    <div className="text-xs text-muted-foreground">{credential.description}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {credential.description}
+                    </div>
                   )}
                   <div className="text-xs text-muted-foreground mt-1">
-                    Added: {new Date(credential.created_at).toLocaleDateString()}
+                    Added:{" "}
+                    {new Date(credential.created_at).toLocaleDateString()}
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
                     size="sm"
-                    variant={credential.is_active ? 'outline' : 'secondary'}
-                    onClick={() => toggleGithubCredential(credential.id, credential.is_active)}
+                    variant={credential.is_active ? "outline" : "secondary"}
+                    onClick={() =>
+                      toggleGithubCredential(
+                        credential.id,
+                        credential.is_active,
+                      )
+                    }
                   >
-                    {credential.is_active ? 'Active' : 'Inactive'}
+                    {credential.is_active ? "Active" : "Inactive"}
                   </Button>
                   <Button
                     size="sm"
@@ -392,7 +441,10 @@ function CredentialsSettings() {
       <div className="pt-6 border-t border-border/50">
         <div className="flex items-center justify-between text-xs italic text-muted-foreground/60">
           <a
-            href={releaseInfo?.htmlUrl || 'https://github.com/siteboon/claudecodeui/releases'}
+            href={
+              packageInfo?.homepage ||
+              "https://www.npmjs.com/package/@epiphytic/claudecodeui"
+            }
             target="_blank"
             rel="noopener noreferrer"
             className="hover:text-muted-foreground transition-colors"
@@ -401,12 +453,17 @@ function CredentialsSettings() {
           </a>
           {updateAvailable && latestVersion && (
             <a
-              href={releaseInfo?.htmlUrl || 'https://github.com/siteboon/claudecodeui/releases'}
+              href={
+                packageInfo?.homepage ||
+                "https://www.npmjs.com/package/@epiphytic/claudecodeui"
+              }
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 px-2 py-0.5 bg-green-500/10 text-green-600 dark:text-green-400 rounded-full hover:bg-green-500/20 transition-colors not-italic font-medium"
             >
-              <span className="text-[10px]">Update available: v{latestVersion}</span>
+              <span className="text-[10px]">
+                Update available: v{latestVersion}
+              </span>
               <ExternalLink className="h-2.5 w-2.5" />
             </a>
           )}
