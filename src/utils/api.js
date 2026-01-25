@@ -89,6 +89,8 @@ export const api = {
     limit = null,
     offset = 0,
     provider = "claude",
+    etag = null,
+    signal = null,
   ) => {
     const params = new URLSearchParams();
     if (limit !== null) {
@@ -106,7 +108,16 @@ export const api = {
     } else {
       url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages${queryString ? `?${queryString}` : ""}`;
     }
-    return authenticatedFetch(url);
+
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
   },
   renameProject: (projectName, displayName) =>
     authenticatedFetch(

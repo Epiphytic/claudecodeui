@@ -2725,6 +2725,9 @@ function ChatInterface({
   const [sessionConflict, setSessionConflict] = useState(null);
   const [externalSessionWarning, setExternalSessionWarning] = useState(null);
   const [sessionState, setSessionState] = useState(null);
+  const [isRefreshingMessages, setIsRefreshingMessages] = useState(false);
+  const messagesEtagRef = useRef(null);
+  const autoRefreshIntervalRef = useRef(null);
   const [provider, setProvider] = useState(() => {
     return localStorage.getItem("selected-provider") || "claude";
   });
@@ -4104,6 +4107,119 @@ function ChatInterface({
     autoScrollToBottom,
     scrollToBottom,
   ]);
+
+  // Manual refresh function with ETag caching support
+  const refreshMessages = useCallback(async () => {
+    if (!selectedSession || !selectedProject || isLoading) return;
+
+    const currentProvider =
+      localStorage.getItem("selected-provider") || "claude";
+
+    // Skip refresh for non-claude providers for now
+    if (currentProvider !== "claude") return;
+
+    setIsRefreshingMessages(true);
+
+    try {
+      const response = await api.sessionMessages(
+        selectedProject.name,
+        selectedSession.id,
+        null, // Get all messages for refresh
+        0,
+        currentProvider,
+        messagesEtagRef.current,
+        null,
+      );
+
+      // Handle 304 Not Modified - no changes
+      if (response.status === 304) {
+        setIsRefreshingMessages(false);
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(`Failed to refresh messages: ${response.status}`);
+      }
+
+      // Store new ETag
+      const newETag = response.headers.get("etag");
+      if (newETag) {
+        messagesEtagRef.current = newETag;
+      }
+
+      const data = await response.json();
+      const newMessages = data.messages || [];
+
+      // Only update if we got new messages
+      if (newMessages.length > 0) {
+        setSessionMessages(newMessages);
+        setTotalMessages(newMessages.length);
+        setHasMoreMessages(false);
+        setMessagesOffset(newMessages.length);
+
+        // Scroll to bottom if user was already near bottom
+        if (isNearBottom && autoScrollToBottom) {
+          setTimeout(() => scrollToBottom(), 100);
+        }
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        console.error("[ChatInterface] Error refreshing messages:", error);
+      }
+    } finally {
+      setIsRefreshingMessages(false);
+    }
+  }, [
+    selectedSession,
+    selectedProject,
+    isLoading,
+    isNearBottom,
+    autoScrollToBottom,
+    scrollToBottom,
+  ]);
+
+  // Auto-refresh every 10 seconds when external session is detected
+  useEffect(() => {
+    // Clear any existing interval
+    if (autoRefreshIntervalRef.current) {
+      clearInterval(autoRefreshIntervalRef.current);
+      autoRefreshIntervalRef.current = null;
+    }
+
+    // Only auto-refresh if external session warning is present and not currently loading
+    if (
+      externalSessionWarning &&
+      selectedSession &&
+      selectedProject &&
+      !isLoading
+    ) {
+      console.log(
+        "[ChatInterface] External session detected, starting auto-refresh",
+      );
+
+      autoRefreshIntervalRef.current = setInterval(() => {
+        refreshMessages();
+      }, 10000); // 10 seconds
+    }
+
+    return () => {
+      if (autoRefreshIntervalRef.current) {
+        clearInterval(autoRefreshIntervalRef.current);
+        autoRefreshIntervalRef.current = null;
+      }
+    };
+  }, [
+    externalSessionWarning,
+    selectedSession,
+    selectedProject,
+    isLoading,
+    refreshMessages,
+  ]);
+
+  // Reset ETag when session changes
+  useEffect(() => {
+    messagesEtagRef.current = null;
+  }, [selectedSession?.id]);
 
   // Update chatMessages when convertedMessages changes
   useEffect(() => {
@@ -6779,6 +6895,43 @@ function ChatInterface({
                   size="sm"
                 />
               )}
+
+              {/* Refresh messages button */}
+              <button
+                type="button"
+                onClick={refreshMessages}
+                disabled={isRefreshingMessages || isLoading || !selectedSession}
+                className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800 ${
+                  isRefreshingMessages
+                    ? "text-blue-500 dark:text-blue-400"
+                    : externalSessionWarning
+                      ? "text-orange-500 hover:text-orange-600 dark:text-orange-400 dark:hover:text-orange-300"
+                      : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                } ${!selectedSession ? "opacity-50 cursor-not-allowed" : ""}`}
+                title={
+                  externalSessionWarning
+                    ? "Refresh messages (auto-refreshing every 10s due to external session)"
+                    : "Refresh messages"
+                }
+              >
+                <svg
+                  className={`w-4 h-4 ${isRefreshingMessages ? "animate-spin" : ""}`}
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                  />
+                </svg>
+                {/* Auto-refresh indicator dot */}
+                {externalSessionWarning && !isRefreshingMessages && (
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
+                )}
+              </button>
 
               {/* Token usage pie chart - positioned next to mode indicator */}
               <TokenUsagePie

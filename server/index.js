@@ -589,7 +589,7 @@ app.get(
   },
 );
 
-// Get messages for a specific session
+// Get messages for a specific session with ETag caching support
 app.get(
   "/api/projects/:projectName/sessions/:sessionId/messages",
   authenticateToken,
@@ -608,6 +608,27 @@ app.get(
         parsedLimit,
         parsedOffset,
       );
+
+      // Generate ETag based on message count and last timestamp
+      const messages = Array.isArray(result) ? result : result.messages || [];
+      const total = Array.isArray(result) ? messages.length : result.total || 0;
+      const lastTimestamp =
+        messages.length > 0
+          ? messages[messages.length - 1]?.timestamp || ""
+          : "";
+      const currentETag = `"${sessionId}-${total}-${Buffer.from(lastTimestamp).toString("base64").slice(0, 16)}"`;
+
+      // Check If-None-Match header for conditional request
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers
+      res.set({
+        "Cache-Control": "private, max-age=5",
+        ETag: currentETag,
+      });
 
       // Handle both old and new response formats
       if (Array.isArray(result)) {
