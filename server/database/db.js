@@ -120,6 +120,27 @@ const runMigrations = () => {
       `);
     }
 
+    // Check if orchestrator_tokens table exists
+    const orchestratorTokensTable = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='orchestrator_tokens'",
+      )
+      .all();
+    if (orchestratorTokensTable.length === 0) {
+      console.log("Running migration: Creating orchestrator_tokens table");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS orchestrator_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          host TEXT NOT NULL UNIQUE,
+          token TEXT NOT NULL,
+          client_id TEXT,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_orchestrator_tokens_host ON orchestrator_tokens(host);
+      `);
+    }
+
     console.log("Database migrations completed successfully");
   } catch (error) {
     console.error("Error running migrations:", error.message);
@@ -642,6 +663,82 @@ const tmuxSessionsDb = {
   },
 };
 
+// Orchestrator tokens database operations (for storing tokens received during pending mode)
+const orchestratorTokensDb = {
+  /**
+   * Get stored orchestrator token for a specific host
+   * @param {string} host - The orchestrator host (e.g., "duratii.example.com")
+   * @returns {{token: string, client_id: string} | null}
+   */
+  getToken: (host) => {
+    try {
+      const row = db
+        .prepare(
+          "SELECT token, client_id FROM orchestrator_tokens WHERE host = ?",
+        )
+        .get(host);
+      return row || null;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  /**
+   * Save or update orchestrator token for a host
+   * @param {string} host - The orchestrator host
+   * @param {string} token - The full token string
+   * @param {string} clientId - The client ID from orchestrator
+   */
+  saveToken: (host, token, clientId) => {
+    try {
+      const stmt = db.prepare(`
+        INSERT INTO orchestrator_tokens (host, token, client_id, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(host) DO UPDATE SET
+          token = excluded.token,
+          client_id = excluded.client_id,
+          updated_at = CURRENT_TIMESTAMP
+      `);
+      stmt.run(host, token, clientId);
+      return true;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  /**
+   * Delete orchestrator token for a host
+   * @param {string} host - The orchestrator host
+   * @returns {boolean} True if a token was deleted
+   */
+  deleteToken: (host) => {
+    try {
+      const stmt = db.prepare("DELETE FROM orchestrator_tokens WHERE host = ?");
+      const result = stmt.run(host);
+      return result.changes > 0;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  /**
+   * Get all stored orchestrator tokens
+   * @returns {Array<{id: number, host: string, client_id: string, created_at: string, updated_at: string}>}
+   */
+  getAllTokens: () => {
+    try {
+      const rows = db
+        .prepare(
+          "SELECT id, host, client_id, created_at, updated_at FROM orchestrator_tokens ORDER BY updated_at DESC",
+        )
+        .all();
+      return rows;
+    } catch (err) {
+      throw err;
+    }
+  },
+};
+
 // Backward compatibility - keep old names pointing to new system
 const githubTokensDb = {
   createGithubToken: (userId, tokenName, githubToken, description = null) => {
@@ -675,4 +772,5 @@ export {
   credentialsDb,
   githubTokensDb, // Backward compatibility
   tmuxSessionsDb,
+  orchestratorTokensDb,
 };

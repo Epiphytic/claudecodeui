@@ -1126,6 +1126,32 @@ async function handleChatMessage(ws, writer, messageData) {
     const sessionIdForTracking =
       data.options?.sessionId || data.sessionId || `session-${Date.now()}`;
 
+    // Handle proactive external session check (before user submits a prompt)
+    if (data.type === "check-external-session") {
+      const projectPath = data.projectPath;
+      if (projectPath) {
+        const externalCheck = detectExternalClaude(projectPath);
+        writer.send({
+          type: "external-session-check-result",
+          projectPath,
+          hasExternalSession: externalCheck.hasExternalSession,
+          details: externalCheck.hasExternalSession
+            ? {
+                processIds: externalCheck.processes.map((p) => p.pid),
+                commands: externalCheck.processes.map((p) => p.command),
+                tmuxSessions: externalCheck.tmuxSessions.map(
+                  (s) => s.sessionName,
+                ),
+                lockFile: externalCheck.lockFile.exists
+                  ? externalCheck.lockFile.lockFile
+                  : null,
+              }
+            : null,
+        });
+      }
+      return;
+    }
+
     if (data.type === "claude-command") {
       console.log("[DEBUG] User message:", data.command || "[Continue/Resume]");
       console.log("📁 Project:", data.options?.projectPath || "Unknown");

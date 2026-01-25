@@ -3963,6 +3963,17 @@ function ChatInterface({
           }
         }
 
+        // Check for external Claude sessions when opening a project/session
+        if (ws && sendMessage && selectedProject) {
+          const projectPath = selectedProject.fullPath || selectedProject.path;
+          if (projectPath) {
+            sendMessage({
+              type: "check-external-session",
+              projectPath,
+            });
+          }
+        }
+
         if (provider === "cursor") {
           // For Cursor, set the session ID for resuming
           setCurrentSessionId(selectedSession.id);
@@ -4249,6 +4260,23 @@ function ChatInterface({
             details: latestMessage.details,
           });
           // Continue with chat - just a warning
+          break;
+
+        case "external-session-check-result":
+          // Proactive external session check result (before user submits prompt)
+          console.log(
+            "[ChatInterface] External session check result:",
+            latestMessage,
+          );
+          if (latestMessage.hasExternalSession) {
+            setExternalSessionWarning({
+              projectPath: latestMessage.projectPath,
+              details: latestMessage.details,
+            });
+          } else {
+            // Clear warning if no external session
+            setExternalSessionWarning(null);
+          }
           break;
 
         case "session-state-update":

@@ -8,12 +8,13 @@
 import { EventEmitter } from "events";
 import WebSocket from "ws";
 import os from "os";
-import { userDb } from "../database/db.js";
+import { userDb, orchestratorTokensDb } from "../database/db.js";
 import { generateToken } from "../middleware/auth.js";
 import {
   createRegisterMessage,
   createStatusUpdateMessage,
   createPingMessage,
+  createPendingRegisterMessage,
   createResponseChunkMessage,
   createResponseCompleteMessage,
   createErrorMessage,
@@ -49,12 +50,16 @@ export class OrchestratorClient extends EventEmitter {
    * Creates a new OrchestratorClient
    * @param {Object} config - Configuration options
    * @param {string} config.url - Orchestrator WebSocket URL
-   * @param {string} config.token - Authentication token
+   * @param {string} [config.token] - Authentication token (optional for pending mode)
    * @param {string} [config.clientId] - Custom client ID (defaults to hostname-pid)
    * @param {number} [config.reconnectInterval] - Base reconnect interval in ms
    * @param {number} [config.heartbeatInterval] - Heartbeat interval in ms
    * @param {Object} [config.metadata] - Additional metadata to send on register
    * @param {string} [config.callbackUrl] - HTTP callback URL for proxying (e.g., http://localhost:3010)
+   * @param {Object} [config.claimPatterns] - Claim patterns for pending mode authorization
+   * @param {string} [config.claimPatterns.user] - GitHub username claim
+   * @param {string} [config.claimPatterns.org] - GitHub organization claim
+   * @param {string} [config.claimPatterns.team] - GitHub team claim (format: org/team-slug)
    */
   constructor(config) {
     super();
@@ -62,13 +67,10 @@ export class OrchestratorClient extends EventEmitter {
     if (!config.url) {
       throw new Error("Orchestrator URL is required");
     }
-    if (!config.token) {
-      throw new Error("Orchestrator token is required");
-    }
 
     this.config = {
       url: config.url,
-      token: config.token,
+      token: config.token || null,
       clientId: config.clientId || `${os.hostname()}-${process.pid}`,
       reconnectInterval: config.reconnectInterval || DEFAULTS.reconnectInterval,
       heartbeatInterval: config.heartbeatInterval || DEFAULTS.heartbeatInterval,
@@ -76,6 +78,7 @@ export class OrchestratorClient extends EventEmitter {
         config.maxReconnectAttempts || DEFAULTS.maxReconnectAttempts,
       metadata: config.metadata || {},
       callbackUrl: config.callbackUrl || null,
+      claimPatterns: config.claimPatterns || {},
     };
 
     this.ws = null;
@@ -88,27 +91,97 @@ export class OrchestratorClient extends EventEmitter {
     this.isConnected = false;
     this.isRegistered = false;
     this.shouldReconnect = true;
+
+    // Pending mode state
+    this.pendingMode = false;
+    this.pendingId = null;
+    this.orchestratorHost = null;
+  }
+
+  /**
+   * Resolves the orchestrator token using precedence rules
+   * @returns {Promise<string|null>} The token or null if none available
+   */
+  async resolveToken() {
+    // 1. Check config first (from .env ORCHESTRATOR_TOKEN)
+    if (this.config.token && this.config.token.trim() !== "") {
+      return this.config.token;
+    }
+
+    // 2. Check database for host-specific token
+    try {
+      const url = new URL(
+        this.config.url
+          .replace("wss://", "https://")
+          .replace("ws://", "http://"),
+      );
+      this.orchestratorHost = url.host;
+
+      const stored = orchestratorTokensDb.getToken(this.orchestratorHost);
+      if (stored?.token) {
+        console.log(
+          `[ORCHESTRATOR] Using stored token for host: ${this.orchestratorHost}`,
+        );
+        return stored.token;
+      }
+    } catch (error) {
+      console.error("[ORCHESTRATOR] Error resolving token:", error.message);
+    }
+
+    // 3. No token available
+    return null;
   }
 
   /**
    * Connects to the orchestrator server
+   * Determines whether to use authenticated or pending mode
    * @returns {Promise<void>} Resolves when connected and registered
    */
   async connect() {
-    return new Promise((resolve, reject) => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
-      }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      return;
+    }
 
+    // Parse host for token storage
+    try {
+      const url = new URL(
+        this.config.url
+          .replace("wss://", "https://")
+          .replace("ws://", "http://"),
+      );
+      this.orchestratorHost = url.host;
+    } catch (error) {
+      console.error("[ORCHESTRATOR] Invalid orchestrator URL:", error.message);
+      throw error;
+    }
+
+    // Resolve token
+    const token = await this.resolveToken();
+
+    if (token) {
+      // Authenticated mode - existing flow
+      this.pendingMode = false;
+      return this.connectWithToken(token);
+    } else {
+      // Pending mode - new flow
+      this.pendingMode = true;
+      return this.connectPending();
+    }
+  }
+
+  /**
+   * Connects in authenticated mode with a token
+   * @param {string} token - The authentication token
+   * @returns {Promise<void>} Resolves when connected and registered
+   */
+  async connectWithToken(token) {
+    return new Promise((resolve, reject) => {
       this.shouldReconnect = true;
 
       try {
         // Build connection URL with token and client_id
-        // This allows ORCHESTRATOR_URL to just be the base URL (e.g., wss://host/ws/connect)
-        // and the token from ORCHESTRATOR_TOKEN is automatically appended
         const connectionUrl = new URL(this.config.url);
-        connectionUrl.searchParams.set("token", this.config.token);
+        connectionUrl.searchParams.set("token", token);
         connectionUrl.searchParams.set("client_id", this.config.clientId);
         const urlString = connectionUrl.toString();
 
@@ -192,6 +265,136 @@ export class OrchestratorClient extends EventEmitter {
         reject(error);
       }
     });
+  }
+
+  /**
+   * Connects in pending mode (no token)
+   * @returns {Promise<void>} Resolves when connected (but not fully registered)
+   */
+  async connectPending() {
+    return new Promise((resolve, reject) => {
+      this.shouldReconnect = true;
+
+      // Build claim patterns from config
+      const { claimPatterns } = this.config;
+      const hasClaimPattern =
+        (claimPatterns.user && claimPatterns.user.trim()) ||
+        (claimPatterns.org && claimPatterns.org.trim()) ||
+        (claimPatterns.team && claimPatterns.team.trim());
+
+      if (!hasClaimPattern) {
+        const error = new Error(
+          "Pending mode requires at least one claim pattern (user, org, or team)",
+        );
+        console.error("[ORCHESTRATOR]", error.message);
+        reject(error);
+        return;
+      }
+
+      try {
+        // Build pending connection URL
+        const pendingUrl = new URL(
+          this.config.url.replace("/ws/connect", "/ws/pending"),
+        );
+        if (claimPatterns.user) {
+          pendingUrl.searchParams.set("user", claimPatterns.user);
+        }
+        if (claimPatterns.org) {
+          pendingUrl.searchParams.set("org", claimPatterns.org);
+        }
+        if (claimPatterns.team) {
+          pendingUrl.searchParams.set("team", claimPatterns.team);
+        }
+
+        console.log(
+          `[ORCHESTRATOR] Connecting in pending mode to ${pendingUrl.origin}${pendingUrl.pathname}`,
+        );
+        this.ws = new WebSocket(pendingUrl.toString());
+
+        const connectTimeout = setTimeout(() => {
+          if (!this.isConnected) {
+            this.ws.terminate();
+            reject(new Error("Connection timeout"));
+          }
+        }, 30000);
+
+        this.ws.on("open", () => {
+          clearTimeout(connectTimeout);
+          console.log("[ORCHESTRATOR] Pending mode connection established");
+          this.isConnected = true;
+          this.reconnectAttempts = 0;
+          this.currentReconnectInterval = this.config.reconnectInterval;
+
+          // Send pending registration message
+          this.sendPendingRegister();
+          this.startHeartbeat();
+          resolve();
+        });
+
+        this.ws.on("message", (data) => {
+          this.handleMessage(data.toString());
+        });
+
+        this.ws.on("close", (code, reason) => {
+          clearTimeout(connectTimeout);
+          const wasConnected = this.isConnected;
+          this.isConnected = false;
+          this.isRegistered = false;
+          this.stopHeartbeat();
+
+          console.log(
+            `[ORCHESTRATOR] Pending connection closed: ${code} ${reason || ""}`,
+          );
+          this.emit("disconnected", { code, reason: reason?.toString() });
+
+          if (this.shouldReconnect) {
+            this.scheduleReconnect();
+          }
+
+          if (!wasConnected) {
+            reject(new Error(`Connection failed: ${code}`));
+          }
+        });
+
+        this.ws.on("error", (error) => {
+          console.error("[ORCHESTRATOR] Pending mode error:", error.message);
+          this.emit("error", error);
+        });
+      } catch (error) {
+        console.error(
+          "[ORCHESTRATOR] Pending connection error:",
+          error.message,
+        );
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * Sends pending registration message for pending mode
+   */
+  sendPendingRegister() {
+    this.pendingId = this.generatePendingId();
+
+    const message = createPendingRegisterMessage(
+      this.pendingId,
+      os.hostname(),
+      process.cwd(),
+      os.platform(),
+    );
+
+    this.sendMessage(message);
+    console.log(
+      "[ORCHESTRATOR] Sent pending registration, waiting for authorization...",
+    );
+  }
+
+  /**
+   * Generates a unique pending ID
+   * @returns {string} Unique pending ID
+   */
+  generatePendingId() {
+    return `pending_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   }
 
   /**
@@ -375,6 +578,23 @@ export class OrchestratorClient extends EventEmitter {
         this.handleHttpProxyRequest(message);
         break;
 
+      // Pending mode messages
+      case InboundMessageTypes.PENDING_REGISTERED:
+        this.handlePendingRegistered(message);
+        break;
+
+      case InboundMessageTypes.TOKEN_GRANTED:
+        this.handleTokenGranted(message);
+        break;
+
+      case InboundMessageTypes.AUTHORIZATION_DENIED:
+        this.handleAuthorizationDenied(message);
+        break;
+
+      case InboundMessageTypes.AUTHORIZATION_TIMEOUT:
+        this.handleAuthorizationTimeout(message);
+        break;
+
       default:
         console.log("[ORCHESTRATOR] Unknown message type:", message.type);
     }
@@ -450,6 +670,94 @@ export class OrchestratorClient extends EventEmitter {
       message.action,
     );
     this.emit("user_request", message);
+  }
+
+  /**
+   * Handles pending registration acknowledgment
+   * @param {Object} message - Pending registered message
+   */
+  handlePendingRegistered(message) {
+    if (message.success) {
+      console.log(
+        "[ORCHESTRATOR] Pending registration accepted:",
+        message.message || "Waiting for authorization",
+      );
+      this.emit("pending_registered");
+    } else {
+      console.error(
+        "[ORCHESTRATOR] Pending registration failed:",
+        message.message || "Unknown error",
+      );
+      this.emit(
+        "error",
+        new Error(message.message || "Pending registration failed"),
+      );
+    }
+  }
+
+  /**
+   * Handles token granted - authorization successful
+   * @param {Object} message - Token granted message
+   */
+  async handleTokenGranted(message) {
+    const { token, client_id } = message;
+
+    console.log("[ORCHESTRATOR] Authorization granted! Received token.");
+
+    // Store token in database for future connections
+    try {
+      orchestratorTokensDb.saveToken(this.orchestratorHost, token, client_id);
+      console.log(
+        `[ORCHESTRATOR] Token stored for host: ${this.orchestratorHost}`,
+      );
+    } catch (error) {
+      console.error("[ORCHESTRATOR] Failed to store token:", error.message);
+    }
+
+    // Update config with new token
+    this.config.token = token;
+    this.config.clientId = client_id;
+    this.pendingMode = false;
+
+    // Emit event for any listeners
+    this.emit("token_granted", { token, client_id });
+
+    // Disconnect and reconnect with the new token
+    console.log("[ORCHESTRATOR] Reconnecting with new token...");
+    this.disconnect();
+
+    // Small delay before reconnecting
+    setTimeout(async () => {
+      try {
+        await this.connectWithToken(token);
+        console.log("[ORCHESTRATOR] Successfully reconnected with new token");
+      } catch (error) {
+        console.error(
+          "[ORCHESTRATOR] Failed to reconnect with new token:",
+          error.message,
+        );
+      }
+    }, 1000);
+  }
+
+  /**
+   * Handles authorization denied
+   * @param {Object} message - Authorization denied message
+   */
+  handleAuthorizationDenied(message) {
+    console.error("[ORCHESTRATOR] Authorization denied:", message.reason);
+    this.emit("authorization_denied", { reason: message.reason });
+  }
+
+  /**
+   * Handles authorization timeout (e.g., 10 minutes expired)
+   * @param {Object} message - Authorization timeout message
+   */
+  handleAuthorizationTimeout(message) {
+    console.warn("[ORCHESTRATOR] Authorization timed out:", message.message);
+    this.emit("authorization_timeout", { message: message.message });
+    // The WebSocket will be closed by the server
+    // The reconnection logic will attempt to reconnect in pending mode again
   }
 
   /**
@@ -548,6 +856,30 @@ export class OrchestratorClient extends EventEmitter {
       // Make the local HTTP request
       const response = await fetch(url, fetchOptions);
 
+      // Log non-200 responses for debugging
+      if (!response.ok) {
+        console.log(
+          `[ORCHESTRATOR] HTTP proxy non-OK response: ${response.status} for ${path}`,
+        );
+      }
+
+      // Handle 304 Not Modified - return immediately with no body
+      if (response.status === 304) {
+        const responseHeaders = [];
+        response.headers.forEach((value, key) => {
+          responseHeaders.push([key, value]);
+        });
+        const proxyResponse = createHttpProxyResponseMessage(
+          request_id,
+          304,
+          responseHeaders,
+          "",
+        );
+        this.sendMessage(proxyResponse);
+        console.log(`[ORCHESTRATOR] HTTP proxy response: 304 Not Modified`);
+        return;
+      }
+
       // Collect response headers
       const responseHeaders = [];
       let contentType = "";
@@ -559,23 +891,34 @@ export class OrchestratorClient extends EventEmitter {
       });
 
       // Determine if content is binary based on content-type
-      // Text types: text/*, application/json, application/javascript, application/xml, etc. with utf-8
+      // Text types: text/*, application/json, application/javascript, application/xml, image/svg+xml, etc.
       const isTextContent =
         contentType.startsWith("text/") ||
         contentType.includes("application/json") ||
         contentType.includes("application/javascript") ||
         contentType.includes("application/xml") ||
+        contentType.includes("image/svg+xml") ||
         contentType.includes("utf-8");
 
       // Get response body - use arrayBuffer for binary, text for text content
       let responseBody;
       if (isTextContent) {
         responseBody = await response.text();
+        if (path.includes("/icons/")) {
+          console.log(
+            `[ORCHESTRATOR] Icon response (text): ${path} - ${responseBody.length} bytes, content-type: ${contentType}`,
+          );
+        }
       } else {
         // Binary content - read as arrayBuffer and base64 encode
         const arrayBuffer = await response.arrayBuffer();
         responseBody = Buffer.from(arrayBuffer).toString("base64");
         responseHeaders.push(["x-orch-encoding", "base64"]);
+        if (path.includes("/icons/")) {
+          console.log(
+            `[ORCHESTRATOR] Icon response (binary/base64): ${path} - original ${arrayBuffer.byteLength} bytes, base64 ${responseBody.length} chars, content-type: ${contentType}`,
+          );
+        }
       }
 
       // Rewrite URLs if proxy_base is provided and content type is HTML or JavaScript
