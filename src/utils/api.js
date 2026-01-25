@@ -71,7 +71,7 @@ export const api = {
     ),
   sessions: (projectName, limit = 5, offset = 0) =>
     authenticatedFetch(
-      `/api/projects/${projectName}/sessions?limit=${limit}&offset=${offset}`,
+      `/api/projects/${encodeURIComponent(projectName)}/sessions?limit=${limit}&offset=${offset}`,
     ),
   sessionMessages: (
     projectName,
@@ -94,25 +94,31 @@ export const api = {
     } else if (provider === "cursor") {
       url = `/api/cursor/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`;
     } else {
-      url = `/api/projects/${projectName}/sessions/${sessionId}/messages${queryString ? `?${queryString}` : ""}`;
+      url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages${queryString ? `?${queryString}` : ""}`;
     }
     return authenticatedFetch(url);
   },
   renameProject: (projectName, displayName) =>
-    authenticatedFetch(`/api/projects/${projectName}/rename`, {
-      method: "PUT",
-      body: JSON.stringify({ displayName }),
-    }),
+    authenticatedFetch(
+      `/api/projects/${encodeURIComponent(projectName)}/rename`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ displayName }),
+      },
+    ),
   deleteSession: (projectName, sessionId) =>
-    authenticatedFetch(`/api/projects/${projectName}/sessions/${sessionId}`, {
-      method: "DELETE",
-    }),
+    authenticatedFetch(
+      `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "DELETE",
+      },
+    ),
   deleteCodexSession: (sessionId) =>
     authenticatedFetch(`/api/codex/sessions/${sessionId}`, {
       method: "DELETE",
     }),
   deleteProject: (projectName) =>
-    authenticatedFetch(`/api/projects/${projectName}`, {
+    authenticatedFetch(`/api/projects/${encodeURIComponent(projectName)}`, {
       method: "DELETE",
     }),
   createProject: (path) =>

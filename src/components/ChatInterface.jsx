@@ -5403,7 +5403,7 @@ function ChatInterface({
     // Fetch token usage for Claude sessions
     const fetchInitialTokenUsage = async () => {
       try {
-        const url = `/api/projects/${selectedProject.name}/sessions/${selectedSession.id}/token-usage`;
+        const url = `/api/projects/${encodeURIComponent(selectedProject.name)}/sessions/${encodeURIComponent(selectedSession.id)}/token-usage`;
         const response = await authenticatedFetch(url);
         if (response.ok) {
           const data = await response.json();
@@ -5550,7 +5550,7 @@ function ChatInterface({
 
         try {
           const response = await authenticatedFetch(
-            `/api/projects/${selectedProject.name}/upload-images`,
+            `/api/projects/${encodeURIComponent(selectedProject.name)}/upload-images`,
             {
               method: "POST",
               headers: {}, // Let browser set Content-Type for FormData
