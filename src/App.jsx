@@ -316,32 +316,13 @@ function AppContent() {
   const fetchProjects = async () => {
     try {
       setIsLoadingProjects(true);
-      const response = await api.projects();
-      const data = await response.json();
-
-      // Always fetch Cursor sessions for each project so we can combine views
-      for (let project of data) {
-        try {
-          const url = `/api/cursor/sessions?projectPath=${encodeURIComponent(project.fullPath || project.path)}`;
-          const cursorResponse = await authenticatedFetch(url);
-          if (cursorResponse.ok) {
-            const cursorData = await cursorResponse.json();
-            if (cursorData.success && cursorData.sessions) {
-              project.cursorSessions = cursorData.sessions;
-            } else {
-              project.cursorSessions = [];
-            }
-          } else {
-            project.cursorSessions = [];
-          }
-        } catch (error) {
-          console.error(
-            `Error fetching Cursor sessions for project ${project.name}:`,
-            error,
-          );
-          project.cursorSessions = [];
-        }
+      // Use the cached projectsList endpoint instead of the heavy projects endpoint
+      const response = await api.projectsList("all");
+      if (!response.ok) {
+        throw new Error(`Failed to fetch projects: ${response.status}`);
       }
+      const result = await response.json();
+      const data = result.projects || [];
 
       // Optimize to preserve object references when data hasn't changed
       setProjects((prevProjects) => {
@@ -361,12 +342,10 @@ function AppContent() {
               newProject.name !== prevProject.name ||
               newProject.displayName !== prevProject.displayName ||
               newProject.fullPath !== prevProject.fullPath ||
+              newProject.sessionCount !== prevProject.sessionCount ||
+              newProject.lastActivity !== prevProject.lastActivity ||
               JSON.stringify(newProject.sessionMeta) !==
-                JSON.stringify(prevProject.sessionMeta) ||
-              JSON.stringify(newProject.sessions) !==
-                JSON.stringify(prevProject.sessions) ||
-              JSON.stringify(newProject.cursorSessions) !==
-                JSON.stringify(prevProject.cursorSessions)
+                JSON.stringify(prevProject.sessionMeta)
             );
           }) || data.length !== prevProjects.length;
 
@@ -393,41 +372,48 @@ function AppContent() {
 
   // Handle URL-based session loading
   useEffect(() => {
-    if (sessionId && projects.length > 0) {
+    const loadSessionFromUrl = async () => {
+      if (!sessionId || projects.length === 0) return;
+
       // Only switch tabs on initial load, not on every project update
       const shouldSwitchTab =
         !selectedSession || selectedSession.id !== sessionId;
-      // Find the session across all projects
-      for (const project of projects) {
-        let session = project.sessions?.find((s) => s.id === sessionId);
-        if (session) {
-          setSelectedProject(project);
-          setSelectedSession({ ...session, __provider: "claude" });
-          // Only switch to chat tab if we're loading a different session
-          if (shouldSwitchTab) {
-            setActiveTab("chat");
-          }
-          return;
-        }
-        // Also check Cursor sessions
-        const cSession = project.cursorSessions?.find(
-          (s) => s.id === sessionId,
-        );
-        if (cSession) {
-          setSelectedProject(project);
-          setSelectedSession({ ...cSession, __provider: "cursor" });
-          if (shouldSwitchTab) {
-            setActiveTab("chat");
-          }
-          return;
-        }
-      }
 
-      // If session not found, it might be a newly created session
-      // Just navigate to it and it will be found when the sidebar refreshes
-      // Don't redirect to home, let the session load naturally
-    }
-  }, [sessionId, projects, navigate]);
+      // Fetch sessions from the cached endpoint to find the session
+      try {
+        const response = await api.sessionsList("all");
+        if (!response.ok) return;
+
+        const result = await response.json();
+        const sessions = result.sessions || [];
+
+        // Find the session by ID
+        const session = sessions.find((s) => s.id === sessionId);
+        if (session) {
+          // Find the corresponding project
+          const project = projects.find(
+            (p) => p.name === session.project?.name,
+          );
+          if (project) {
+            setSelectedProject(project);
+            setSelectedSession({
+              ...session,
+              __provider: session.provider || "claude",
+            });
+            if (shouldSwitchTab) {
+              setActiveTab("chat");
+            }
+          }
+        }
+        // If session not found, it might be a newly created session
+        // Just navigate to it and it will be found when the sidebar refreshes
+      } catch (error) {
+        console.error("Error loading session from URL:", error);
+      }
+    };
+
+    loadSessionFromUrl();
+  }, [sessionId, projects]);
 
   const handleProjectSelect = (project) => {
     // Don't show loading if selecting the same project
@@ -489,12 +475,12 @@ function AppContent() {
       navigate("/");
     }
 
-    // Update projects state locally instead of full refresh
+    // Update projects state locally - decrement session count
+    // The Sidebar's useSessionsList will handle updating its own session list
     setProjects((prevProjects) =>
       prevProjects.map((project) => ({
         ...project,
-        sessions:
-          project.sessions?.filter((session) => session.id !== sessionId) || [],
+        sessionCount: Math.max(0, (project.sessionCount || 0) - 1),
         sessionMeta: {
           ...project.sessionMeta,
           total: Math.max(0, (project.sessionMeta?.total || 0) - 1),
@@ -504,10 +490,14 @@ function AppContent() {
   };
 
   const handleSidebarRefresh = async () => {
-    // Refresh only the sessions for all projects, don't change selected state
+    // Refresh projects using the cached endpoint
     try {
-      const response = await api.projects();
-      const freshProjects = await response.json();
+      const response = await api.projectsList("all");
+      if (!response.ok) {
+        throw new Error(`Failed to refresh projects: ${response.status}`);
+      }
+      const result = await response.json();
+      const freshProjects = result.projects || [];
 
       // Optimize to preserve object references and minimize re-renders
       setProjects((prevProjects) => {
@@ -521,10 +511,10 @@ function AppContent() {
               newProject.name !== prevProject.name ||
               newProject.displayName !== prevProject.displayName ||
               newProject.fullPath !== prevProject.fullPath ||
+              newProject.sessionCount !== prevProject.sessionCount ||
+              newProject.lastActivity !== prevProject.lastActivity ||
               JSON.stringify(newProject.sessionMeta) !==
-                JSON.stringify(prevProject.sessionMeta) ||
-              JSON.stringify(newProject.sessions) !==
-                JSON.stringify(prevProject.sessions)
+                JSON.stringify(prevProject.sessionMeta)
             );
           }) || freshProjects.length !== prevProjects.length;
 

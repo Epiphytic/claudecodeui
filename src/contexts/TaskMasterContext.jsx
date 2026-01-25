@@ -82,25 +82,27 @@ export const TaskMasterProvider = ({ children }) => {
 
   // This will be defined after the functions are declared
 
-  // Refresh projects with TaskMaster metadata
+  // Refresh projects with TaskMaster metadata using the cached endpoint
   const refreshProjects = useCallback(async () => {
     // Only make API calls if user is authenticated
     if (!user || !token) {
       setProjects([]);
-      setCurrentProjectState(null); // This might be the problem!
+      setCurrentProjectState(null);
       return;
     }
 
     try {
       setIsLoading(true);
       clearError();
-      const response = await api.get("/projects");
+      // Use the cached projectsList endpoint instead of the heavy projects endpoint
+      const response = await api.projectsList("all");
 
       if (!response.ok) {
         throw new Error(`Failed to fetch projects: ${response.status}`);
       }
 
-      const projectsData = await response.json();
+      const result = await response.json();
+      const projectsData = result.projects || [];
 
       // Check if projectsData is an array
       if (!Array.isArray(projectsData)) {
@@ -109,13 +111,14 @@ export const TaskMasterProvider = ({ children }) => {
         return;
       }
 
-      // Filter and enrich projects with TaskMaster data
+      // The slim format already includes hasTaskmaster
+      // Enrich with additional TaskMaster fields for compatibility
       const enrichedProjects = projectsData.map((project) => ({
         ...project,
-        taskMasterConfigured: project.taskmaster?.hasTaskmaster || false,
-        taskMasterStatus: project.taskmaster?.status || "not-configured",
-        taskCount: project.taskmaster?.metadata?.taskCount || 0,
-        completedCount: project.taskmaster?.metadata?.completed || 0,
+        taskMasterConfigured: project.hasTaskmaster || false,
+        taskMasterStatus: project.hasTaskmaster
+          ? "configured"
+          : "not-configured",
       }));
 
       setProjects(enrichedProjects);
@@ -127,7 +130,10 @@ export const TaskMasterProvider = ({ children }) => {
         );
         if (updatedCurrent) {
           setCurrentProjectState(updatedCurrent);
-          setProjectTaskMaster(updatedCurrent.taskmaster);
+          // TaskMaster details would need to be fetched separately if needed
+          setProjectTaskMaster(
+            updatedCurrent.hasTaskmaster ? { hasTaskmaster: true } : null,
+          );
         }
       }
     } catch (err) {
