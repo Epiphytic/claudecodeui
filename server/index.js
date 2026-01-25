@@ -379,6 +379,70 @@ const wss = new WebSocketServer({
 app.locals.wss = wss;
 
 app.use(cors());
+
+// Request/Response logging middleware for debugging
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const originalSend = res.send;
+  const originalJson = res.json;
+
+  // Capture response for logging
+  res.send = function (body) {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+
+    // Log 4xx errors with headers
+    if (statusCode >= 400 && statusCode < 500) {
+      console.log(
+        `[HTTP ${statusCode}] ${req.method} ${req.originalUrl} (${duration}ms)`,
+      );
+      console.log(`  Request Headers:`, JSON.stringify(req.headers, null, 2));
+      console.log(
+        `  Response:`,
+        typeof body === "string" ? body.slice(0, 500) : body,
+      );
+    }
+    // Log 5xx errors with full details
+    else if (statusCode >= 500) {
+      console.error(
+        `[HTTP ${statusCode}] ${req.method} ${req.originalUrl} (${duration}ms)`,
+      );
+      console.error(`  Request Headers:`, JSON.stringify(req.headers, null, 2));
+      console.error(`  Request Body:`, req.body);
+      console.error(`  Response:`, body);
+    }
+
+    return originalSend.call(this, body);
+  };
+
+  res.json = function (body) {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+
+    // Log 4xx errors with headers
+    if (statusCode >= 400 && statusCode < 500) {
+      console.log(
+        `[HTTP ${statusCode}] ${req.method} ${req.originalUrl} (${duration}ms)`,
+      );
+      console.log(`  Request Headers:`, JSON.stringify(req.headers, null, 2));
+      console.log(`  Response:`, JSON.stringify(body, null, 2).slice(0, 500));
+    }
+    // Log 5xx errors with full details
+    else if (statusCode >= 500) {
+      console.error(
+        `[HTTP ${statusCode}] ${req.method} ${req.originalUrl} (${duration}ms)`,
+      );
+      console.error(`  Request Headers:`, JSON.stringify(req.headers, null, 2));
+      console.error(`  Request Body:`, req.body);
+      console.error(`  Response:`, JSON.stringify(body, null, 2));
+    }
+
+    return originalJson.call(this, body);
+  };
+
+  next();
+});
+
 app.use(
   express.json({
     limit: "50mb",
@@ -400,6 +464,56 @@ app.get("/health", (req, res) => {
     status: "ok",
     timestamp: new Date().toISOString(),
   });
+});
+
+// Explicit route for manifest.json (PWA manifest)
+app.get("/manifest.json", (req, res) => {
+  const manifestPath = path.join(__dirname, "../public/manifest.json");
+  const distManifestPath = path.join(__dirname, "../dist/manifest.json");
+
+  console.log("[manifest.json] Request received");
+  console.log("[manifest.json] __dirname:", __dirname);
+  console.log("[manifest.json] Checking paths:");
+  console.log(
+    "  - public:",
+    manifestPath,
+    "exists:",
+    fs.existsSync(manifestPath),
+  );
+  console.log(
+    "  - dist:",
+    distManifestPath,
+    "exists:",
+    fs.existsSync(distManifestPath),
+  );
+
+  // Try public first, then dist
+  if (fs.existsSync(manifestPath)) {
+    console.log("[manifest.json] Serving from public");
+    res.setHeader("Content-Type", "application/manifest+json");
+    res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
+    res.sendFile(manifestPath, (err) => {
+      if (err) {
+        console.error("[manifest.json] sendFile error:", err);
+        res.status(500).json({ error: "Failed to send manifest.json" });
+      }
+    });
+  } else if (fs.existsSync(distManifestPath)) {
+    console.log("[manifest.json] Serving from dist");
+    res.setHeader("Content-Type", "application/manifest+json");
+    res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
+    res.sendFile(distManifestPath, (err) => {
+      if (err) {
+        console.error("[manifest.json] sendFile error:", err);
+        res.status(500).json({ error: "Failed to send manifest.json" });
+      }
+    });
+  } else {
+    console.error("[ERROR] manifest.json not found in public or dist");
+    console.error("  Checked:", manifestPath);
+    console.error("  Checked:", distManifestPath);
+    res.status(404).json({ error: "manifest.json not found" });
+  }
 });
 
 // Optional API key validation (if configured)
@@ -1156,8 +1270,20 @@ async function handleChatMessage(ws, writer, messageData) {
     // Handle proactive external session check (before user submits a prompt)
     if (data.type === "check-external-session") {
       const projectPath = data.projectPath;
+      console.log(
+        "[ExternalSessionCheck] Checking for external sessions:",
+        projectPath,
+      );
       if (projectPath) {
         const externalCheck = detectExternalClaude(projectPath);
+        console.log("[ExternalSessionCheck] Result:", {
+          hasExternalSession: externalCheck.hasExternalSession,
+          detectionAvailable: externalCheck.detectionAvailable,
+          detectionError: externalCheck.detectionError,
+          processCount: externalCheck.processes.length,
+          tmuxCount: externalCheck.tmuxSessions.length,
+          hasLockFile: externalCheck.lockFile.exists,
+        });
         writer.send({
           type: "external-session-check-result",
           projectPath,
@@ -1177,6 +1303,8 @@ async function handleChatMessage(ws, writer, messageData) {
               }
             : null,
         });
+      } else {
+        console.log("[ExternalSessionCheck] No projectPath provided");
       }
       return;
     }
@@ -2661,6 +2789,9 @@ app.get(
 app.get("*", (req, res) => {
   // Skip requests for static assets (files with extensions)
   if (path.extname(req.path)) {
+    console.log(
+      `[404] Static file not found: ${req.path} (not served by express.static)`,
+    );
     return res.status(404).send("Not found");
   }
 

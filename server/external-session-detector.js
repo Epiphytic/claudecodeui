@@ -34,6 +34,10 @@ function detectClaudeProcesses() {
   let detectionAvailable = true;
   let error = null;
 
+  console.log("[ExternalSessionDetector] detectClaudeProcesses() called");
+  console.log("[ExternalSessionDetector] Platform:", os.platform());
+  console.log("[ExternalSessionDetector] Current PID:", currentPid);
+
   if (os.platform() === "win32") {
     // Windows: use wmic or tasklist
     try {
@@ -76,9 +80,14 @@ function detectClaudeProcesses() {
         encoding: "utf8",
         stdio: "pipe",
       });
+      console.log(
+        "[ExternalSessionDetector] pgrep available:",
+        pgrepCheck.status === 0,
+      );
 
       if (pgrepCheck.status !== 0) {
         // pgrep not available, try ps aux as fallback
+        console.log("[ExternalSessionDetector] Using ps aux fallback");
         try {
           const psResult = spawnSync("ps", ["aux"], {
             encoding: "utf8",
@@ -87,19 +96,29 @@ function detectClaudeProcesses() {
 
           if (psResult.status === 0) {
             const lines = psResult.stdout.split("\n");
-            for (const line of lines) {
-              if (
+            const claudeLines = lines.filter(
+              (line) =>
                 line.toLowerCase().includes("claude") &&
-                !line.includes(String(currentPid))
-              ) {
-                const parts = line.trim().split(/\s+/);
-                if (parts.length >= 2) {
-                  const pid = parseInt(parts[1], 10);
-                  if (!isNaN(pid) && pid !== currentPid) {
-                    const command = parts.slice(10).join(" ");
-                    if (isExternalClaudeProcess(command)) {
-                      processes.push({ pid, command, cwd: null });
-                    }
+                !line.includes(String(currentPid)),
+            );
+            console.log(
+              "[ExternalSessionDetector] ps aux found",
+              claudeLines.length,
+              'lines containing "claude"',
+            );
+
+            for (const line of claudeLines) {
+              const parts = line.trim().split(/\s+/);
+              if (parts.length >= 2) {
+                const pid = parseInt(parts[1], 10);
+                if (!isNaN(pid) && pid !== currentPid) {
+                  const command = parts.slice(10).join(" ");
+                  const isExternal = isExternalClaudeProcess(command);
+                  console.log(
+                    `[ExternalSessionDetector] PID ${pid}: "${command.slice(0, 60)}..." isExternal=${isExternal}`,
+                  );
+                  if (isExternal) {
+                    processes.push({ pid, command, cwd: null });
                   }
                 }
               }
@@ -107,10 +126,12 @@ function detectClaudeProcesses() {
           } else {
             detectionAvailable = false;
             error = "Neither pgrep nor ps aux available";
+            console.log("[ExternalSessionDetector] ps aux failed");
           }
         } catch (e) {
           detectionAvailable = false;
           error = `Process detection failed: ${e.message}`;
+          console.log("[ExternalSessionDetector] ps aux exception:", e.message);
         }
       } else {
         // pgrep is available, use it
@@ -118,15 +139,25 @@ function detectClaudeProcesses() {
           encoding: "utf8",
           stdio: "pipe",
         });
+        console.log(
+          "[ExternalSessionDetector] pgrep status:",
+          pgrepResult.status,
+        );
 
         if (pgrepResult.status === 0) {
           const pids = pgrepResult.stdout.trim().split("\n").filter(Boolean);
+          console.log("[ExternalSessionDetector] pgrep found PIDs:", pids);
 
           for (const pidStr of pids) {
             const pid = parseInt(pidStr, 10);
 
             // Skip our own process and child processes
-            if (pid === currentPid) continue;
+            if (pid === currentPid) {
+              console.log(
+                `[ExternalSessionDetector] Skipping our own PID ${pid}`,
+              );
+              continue;
+            }
 
             // Get command details
             const psResult = spawnSync(
@@ -140,10 +171,14 @@ function detectClaudeProcesses() {
 
             if (psResult.status === 0) {
               const command = psResult.stdout.trim();
+              const isExternal = isExternalClaudeProcess(command);
+              console.log(
+                `[ExternalSessionDetector] PID ${pid}: "${command.slice(0, 80)}..." isExternal=${isExternal}`,
+              );
 
               // Filter out our own subprocesses (claude-sdk spawned by this app)
               // and only include standalone claude CLI invocations
-              if (isExternalClaudeProcess(command)) {
+              if (isExternal) {
                 // Try to get working directory via lsof
                 let cwd = null;
                 try {
@@ -169,12 +204,21 @@ function detectClaudeProcesses() {
               }
             }
           }
+        } else {
+          console.log(
+            "[ExternalSessionDetector] pgrep found no claude processes (status:",
+            pgrepResult.status,
+            ")",
+          );
         }
-        // pgrep returning non-zero just means no processes found, not an error
       }
     } catch (e) {
       detectionAvailable = false;
       error = `Unix process detection failed: ${e.message}`;
+      console.log(
+        "[ExternalSessionDetector] Unix detection exception:",
+        e.message,
+      );
     }
   }
 
@@ -188,18 +232,30 @@ function detectClaudeProcesses() {
  */
 function isExternalClaudeProcess(command) {
   // Skip node processes (SDK internals)
-  if (command.startsWith("node ")) return false;
+  if (command.startsWith("node ")) {
+    console.log("[isExternalClaudeProcess] Rejected: starts with 'node '");
+    return false;
+  }
 
   // Skip our own server
-  if (command.includes("claudecodeui/server")) return false;
+  if (command.includes("claudecodeui/server")) {
+    console.log(
+      "[isExternalClaudeProcess] Rejected: contains 'claudecodeui/server'",
+    );
+    return false;
+  }
 
   // Look for actual claude CLI invocations
-  return (
+  const isExternal =
     command.includes("claude ") ||
     command.includes("claude-code") ||
     command.match(/\/claude\s/) ||
-    command.endsWith("/claude")
+    command.endsWith("/claude");
+
+  console.log(
+    `[isExternalClaudeProcess] "${command.slice(0, 60)}..." => ${isExternal}`,
   );
+  return isExternal;
 }
 
 /**
@@ -342,12 +398,16 @@ function processExists(pid) {
  * @returns {{ hasExternalSession: boolean, processes: Array, tmuxSessions: Array, lockFile: object, detectionAvailable: boolean, detectionError: string | null }}
  */
 function detectExternalClaude(projectPath) {
+  console.log("[detectExternalClaude] Called with projectPath:", projectPath);
+
   // Check cache
   const cacheKey = projectPath || "__global__";
   const cached = detectionCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    console.log("[detectExternalClaude] Returning cached result");
     return cached.result;
   }
+  console.log("[detectExternalClaude] Cache miss, performing fresh detection");
 
   const result = {
     hasExternalSession: false,
@@ -363,16 +423,35 @@ function detectExternalClaude(projectPath) {
   result.processes = processDetection.processes;
   result.detectionAvailable = processDetection.detectionAvailable;
   result.detectionError = processDetection.error;
+  console.log(
+    "[detectExternalClaude] Process detection result:",
+    processDetection.processes.length,
+    "processes, available:",
+    processDetection.detectionAvailable,
+    "error:",
+    processDetection.error,
+  );
 
   if (projectPath) {
     // Filter to processes in this project
+    const beforeFilter = result.processes.length;
     result.processes = result.processes.filter(
       (p) => !p.cwd || p.cwd.startsWith(projectPath),
+    );
+    console.log(
+      "[detectExternalClaude] Filtered processes for project:",
+      beforeFilter,
+      "->",
+      result.processes.length,
     );
   }
 
   // Detect tmux sessions
   result.tmuxSessions = detectClaudeTmuxSessions();
+  console.log(
+    "[detectExternalClaude] tmux sessions found:",
+    result.tmuxSessions.length,
+  );
 
   // Check lock file
   if (projectPath) {
