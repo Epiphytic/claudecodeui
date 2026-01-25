@@ -2842,8 +2842,6 @@ function ChatInterface({
   const [externalSessionWarning, setExternalSessionWarning] = useState(null);
   const [sessionState, setSessionState] = useState(null);
   const [isRefreshingMessages, setIsRefreshingMessages] = useState(false);
-  const messagesEtagRef = useRef(null);
-  const autoRefreshIntervalRef = useRef(null);
   const statusTimeoutRef = useRef(null);
   const STATUS_TIMEOUT_MS = 60000; // 60 seconds without status update = reset loading
   const [provider, setProvider] = useState(() => {
@@ -4458,7 +4456,7 @@ function ChatInterface({
     pollForNewMessages,
   ]);
 
-  // Manual refresh function with ETag caching support
+  // Manual refresh function using efficient cached message loading
   const refreshMessages = useCallback(async () => {
     if (!selectedSession || !selectedProject || isLoading) return;
 
@@ -4471,46 +4469,12 @@ function ChatInterface({
     setIsRefreshingMessages(true);
 
     try {
-      const response = await api.sessionMessages(
-        selectedProject.name,
-        selectedSession.id,
-        null, // Get all messages for refresh
-        0,
-        currentProvider,
-        messagesEtagRef.current,
-        null,
-      );
+      // Use the efficient polling mechanism to check for new messages
+      await pollForNewMessages(selectedProject.name, selectedSession.id);
 
-      // Handle 304 Not Modified - no changes
-      if (response.status === 304) {
-        setIsRefreshingMessages(false);
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(`Failed to refresh messages: ${response.status}`);
-      }
-
-      // Store new ETag
-      const newETag = response.headers.get("etag");
-      if (newETag) {
-        messagesEtagRef.current = newETag;
-      }
-
-      const data = await response.json();
-      const newMessages = data.messages || [];
-
-      // Only update if we got new messages
-      if (newMessages.length > 0) {
-        setSessionMessages(newMessages);
-        setTotalMessages(newMessages.length);
-        setHasMoreMessages(false);
-        setMessagesOffset(newMessages.length);
-
-        // Scroll to bottom if user was already near bottom
-        if (isNearBottom && autoScrollToBottom) {
-          setTimeout(() => scrollToBottom(), 100);
-        }
+      // Scroll to bottom if user was already near bottom
+      if (isNearBottom && autoScrollToBottom) {
+        setTimeout(() => scrollToBottom(), 100);
       }
     } catch (error) {
       if (error.name !== "AbortError") {
@@ -4526,50 +4490,12 @@ function ChatInterface({
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
+    pollForNewMessages,
   ]);
 
-  // Auto-refresh every 10 seconds when external session is detected
-  useEffect(() => {
-    // Clear any existing interval
-    if (autoRefreshIntervalRef.current) {
-      clearInterval(autoRefreshIntervalRef.current);
-      autoRefreshIntervalRef.current = null;
-    }
-
-    // Only auto-refresh if external session warning is present and not currently loading
-    if (
-      externalSessionWarning &&
-      selectedSession &&
-      selectedProject &&
-      !isLoading
-    ) {
-      console.log(
-        "[ChatInterface] External session detected, starting auto-refresh",
-      );
-
-      autoRefreshIntervalRef.current = setInterval(() => {
-        refreshMessages();
-      }, 10000); // 10 seconds
-    }
-
-    return () => {
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-    };
-  }, [
-    externalSessionWarning,
-    selectedSession,
-    selectedProject,
-    isLoading,
-    refreshMessages,
-  ]);
-
-  // Reset ETag when session changes
-  useEffect(() => {
-    messagesEtagRef.current = null;
-  }, [selectedSession?.id]);
+  // Note: Auto-refresh is now handled by the polling effect above (messagePollingRef)
+  // The polling system checks for new messages every 10 seconds when the chat is active
+  // Message caches are reset when session changes (in the loadMessages effect)
 
   // Update chatMessages when convertedMessages changes
   useEffect(() => {
