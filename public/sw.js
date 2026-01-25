@@ -1,7 +1,7 @@
 // Service Worker for Claude Code UI PWA
 // Supports both direct access and orchestrator proxy access via proxyBase parameter
 
-const CACHE_NAME = "claude-ui-v1";
+const CACHE_NAME = "claude-ui-v2";
 
 // Extract proxyBase from the service worker URL query string
 // e.g., sw.js?proxyBase=/clients/badal-laptop/proxy
@@ -62,6 +62,30 @@ self.addEventListener("fetch", (event) => {
     (async () => {
       const request = event.request;
       const normalizedUrl = normalizeUrl(request.url);
+
+      // Use network-first for manifest.json to ensure fresh content
+      if (
+        normalizedUrl.endsWith("/manifest.json") ||
+        normalizedUrl === "manifest.json"
+      ) {
+        try {
+          const networkResponse = await fetch(request);
+          // Only cache successful responses
+          if (networkResponse.ok) {
+            const cache = await caches.open(CACHE_NAME);
+            cache.put(request, networkResponse.clone());
+          }
+          return networkResponse;
+        } catch {
+          // Fall back to cache if network fails
+          const cache = await caches.open(CACHE_NAME);
+          const cachedResponse = await cache.match(request);
+          if (cachedResponse) {
+            return cachedResponse;
+          }
+          throw new Error("manifest.json not available");
+        }
+      }
 
       // Try to find a cached response using the normalized URL
       const cache = await caches.open(CACHE_NAME);
