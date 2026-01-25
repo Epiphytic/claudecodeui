@@ -2415,6 +2415,9 @@ app.get(
     try {
       const { projectName, sessionId } = req.params;
       const { provider = "claude" } = req.query;
+      console.log(
+        `[TOKEN-USAGE] Request for project: ${projectName}, session: ${sessionId}, provider: ${provider}`,
+      );
       const homeDir = os.homedir();
 
       // Allow only safe characters in sessionId

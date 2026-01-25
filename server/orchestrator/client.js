@@ -768,7 +768,9 @@ export class OrchestratorClient extends EventEmitter {
   async handleHttpProxyRequest(message) {
     const { request_id, method, path, headers, body, query, proxy_base } =
       message;
-    console.log(`[ORCHESTRATOR] HTTP proxy request: ${method} ${path}`);
+    console.log(
+      `[ORCHESTRATOR] HTTP proxy request: ${method} ${path} (proxy_base: ${proxy_base || "none"})`,
+    );
 
     try {
       // Extract orchestrator user info from headers for auto-authentication
