@@ -3595,9 +3595,9 @@ function ChatInterface({
       isMessagePollingRef.current = true;
 
       const nextNumber = lastKnownMessageNumberRef.current + 1;
-      const newMessages = [];
 
       try {
+        // First, check if there's a new message by fetching the next one
         const response = await api.messageByNumber(
           projectName,
           sessionId,
@@ -3605,43 +3605,52 @@ function ChatInterface({
         );
 
         if (response.ok) {
-          // New message found! Fetch it and any subsequent messages
-          const data = await response.json();
-          messageBodiesCacheRef.current.set(data.number, data.message);
-          newMessages.push(data.message);
+          // New message found! Now fetch the list to know total count
+          const listResponse = await api.messagesList(projectName, sessionId);
+          if (!listResponse.ok) {
+            // Fallback: just use this single message
+            const data = await response.json();
+            messageBodiesCacheRef.current.set(data.number, data.message);
+            lastKnownMessageNumberRef.current = nextNumber;
+            setSessionMessages((prev) => [...prev, data.message]);
+            setTotalMessages((prev) => prev + 1);
+            resetPollingIntervals();
+            isMessagePollingRef.current = false;
+            return true;
+          }
 
-          // Keep fetching until we get a 404
-          let currentNumber = nextNumber + 1;
-          let hasMore = true;
+          const listData = await listResponse.json();
+          const totalCount = listData.total;
 
-          while (hasMore) {
-            const nextResponse = await api.messageByNumber(
-              projectName,
-              sessionId,
-              currentNumber,
-            );
+          // Use range endpoint to fetch all new messages at once
+          const rangeResponse = await api.messagesByRange(
+            projectName,
+            sessionId,
+            nextNumber,
+            totalCount,
+          );
 
-            if (nextResponse.ok) {
-              const nextData = await nextResponse.json();
-              messageBodiesCacheRef.current.set(
-                nextData.number,
-                nextData.message,
-              );
-              newMessages.push(nextData.message);
-              currentNumber++;
-            } else {
-              hasMore = false;
+          const newMessages = [];
+          if (rangeResponse.ok) {
+            const rangeData = await rangeResponse.json();
+            for (const msg of rangeData.messages) {
+              messageBodiesCacheRef.current.set(msg.number, msg);
+              newMessages.push(msg);
             }
+          } else {
+            // Fallback: use the single message we already fetched
+            const data = await response.json();
+            messageBodiesCacheRef.current.set(data.number, data.message);
+            newMessages.push(data.message);
           }
 
           // Update last known number
-          lastKnownMessageNumberRef.current = currentNumber - 1;
+          lastKnownMessageNumberRef.current = totalCount;
 
-          // Append new messages directly to state (messages are immutable, no need to re-fetch list)
+          // Append new messages directly to state
           if (newMessages.length > 0) {
             setSessionMessages((prev) => [...prev, ...newMessages]);
-            setTotalMessages((prev) => prev + newMessages.length);
-            // Reset polling intervals when new messages found
+            setTotalMessages(totalCount);
             resetPollingIntervals();
             isMessagePollingRef.current = false;
             return true;
@@ -4721,23 +4730,28 @@ function ChatInterface({
               // Check if we have new messages
               const currentCount = lastKnownMessageNumberRef.current;
               if (listData.total > currentCount) {
-                // New messages! Fetch only missing ones from cache
-                for (let i = currentCount + 1; i <= listData.total; i++) {
-                  // Skip if already in cache
-                  if (messageBodiesCacheRef.current.has(i)) {
-                    continue;
-                  }
-                  const msgResponse = await api.messageByNumber(
+                // Find the first missing message number (skip those already in cache)
+                let startNum = currentCount + 1;
+                while (
+                  startNum <= listData.total &&
+                  messageBodiesCacheRef.current.has(startNum)
+                ) {
+                  startNum++;
+                }
+
+                // Fetch all missing messages in one range request
+                if (startNum <= listData.total) {
+                  const rangeResponse = await api.messagesByRange(
                     selectedProject.name,
                     selectedSession.id,
-                    i,
+                    startNum,
+                    listData.total,
                   );
-                  if (msgResponse.ok) {
-                    const msgData = await msgResponse.json();
-                    messageBodiesCacheRef.current.set(
-                      msgData.number,
-                      msgData.message,
-                    );
+                  if (rangeResponse.ok) {
+                    const rangeData = await rangeResponse.json();
+                    for (const msg of rangeData.messages) {
+                      messageBodiesCacheRef.current.set(msg.number, msg);
+                    }
                   }
                 }
                 lastKnownMessageNumberRef.current = listData.total;
@@ -4834,21 +4848,19 @@ function ChatInterface({
         const listData = await listResponse.json();
         const etag = listResponse.headers.get("etag");
 
-        // Fetch any missing messages
+        // Fetch any missing messages using range endpoint
         const currentCount = lastKnownMessageNumberRef.current;
         if (listData.total > currentCount) {
-          for (let i = currentCount + 1; i <= listData.total; i++) {
-            const msgResponse = await api.messageByNumber(
-              selectedProject.name,
-              selectedSession.id,
-              i,
-            );
-            if (msgResponse.ok) {
-              const msgData = await msgResponse.json();
-              messageBodiesCacheRef.current.set(
-                msgData.number,
-                msgData.message,
-              );
+          const rangeResponse = await api.messagesByRange(
+            selectedProject.name,
+            selectedSession.id,
+            currentCount + 1,
+            listData.total,
+          );
+          if (rangeResponse.ok) {
+            const rangeData = await rangeResponse.json();
+            for (const msg of rangeData.messages) {
+              messageBodiesCacheRef.current.set(msg.number, msg);
             }
           }
           lastKnownMessageNumberRef.current = listData.total;
