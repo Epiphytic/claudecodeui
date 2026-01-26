@@ -114,7 +114,11 @@ import cliAuthRoutes from "./routes/cli-auth.js";
 import userRoutes from "./routes/user.js";
 import codexRoutes from "./routes/codex.js";
 import sessionsRoutes from "./routes/sessions.js";
-import { updateSessionsCache } from "./sessions-cache.js";
+import { updateSessionsCache, updateSessionTitle } from "./sessions-cache.js";
+import {
+  getSessionTitleFromHistory,
+  invalidateCache as invalidateHistoryCache,
+} from "./history-cache.js";
 import {
   getMessageList,
   getMessageByNumber,
@@ -1604,6 +1608,27 @@ async function handleChatMessage(ws, writer, messageData) {
         // Mark as no longer busy
         if (orchestratorStatusHooks) {
           orchestratorStatusHooks.onQueryEnd(sessionIdForTracking);
+        }
+
+        // Update session title from history.jsonl (last user prompt)
+        try {
+          // Invalidate history cache to get fresh data
+          invalidateHistoryCache();
+          const newTitle = await getSessionTitleFromHistory(sessionId);
+          if (newTitle) {
+            const updated = updateSessionTitle(sessionId, newTitle);
+            if (updated) {
+              log.debug(
+                { sessionId, title: newTitle.slice(0, 50) },
+                "Updated session title from history",
+              );
+            }
+          }
+        } catch (titleError) {
+          log.debug(
+            { sessionId, error: titleError.message },
+            "Failed to update session title",
+          );
         }
       }
     } else if (data.type === "cursor-command") {

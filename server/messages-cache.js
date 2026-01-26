@@ -7,6 +7,7 @@
  * - Individual message caching by number
  * - File watching for cache invalidation
  * - Memory-efficient storage
+ * - Integration with history.jsonl for user prompts
  */
 
 import fs from "fs";
@@ -14,6 +15,10 @@ import fsPromises from "fs/promises";
 import path from "path";
 import os from "os";
 import readline from "readline";
+import { getSessionPrompts } from "./history-cache.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("messages-cache");
 
 // Cache storage
 // Structure: Map<cacheKey, { list: [], messages: Map<number, message>, mtime: number, timestamp: number }>
@@ -107,9 +112,9 @@ async function loadSessionMessages(projectName, sessionId) {
 
     return messages;
   } catch (error) {
-    console.error(
-      `[MessagesCache] Error loading messages for ${sessionId}:`,
-      error.message,
+    log.error(
+      { sessionId, error: error.message },
+      "Error loading messages for session",
     );
     return [];
   }
@@ -164,15 +169,36 @@ async function getSessionCache(projectName, sessionId, forceRefresh = false) {
 
 /**
  * Get message list (IDs and numbers only)
+ * Also includes user prompts from history.jsonl that may not be in the session file
  * Returns: { messages: [{ number, id, timestamp, type }], total: number }
  */
 async function getMessageList(projectName, sessionId) {
   const cache = await getSessionCache(projectName, sessionId);
 
+  // Get history prompts for this session
+  let historyPrompts = [];
+  try {
+    historyPrompts = await getSessionPrompts(sessionId);
+  } catch (e) {
+    log.debug({ error: e.message }, "Failed to get history prompts");
+  }
+
+  // If we have history prompts and they provide additional context,
+  // include the last prompt info in the response
+  let lastUserPrompt = null;
+  if (historyPrompts.length > 0) {
+    const lastPrompt = historyPrompts[historyPrompts.length - 1];
+    lastUserPrompt = {
+      prompt: lastPrompt.prompt,
+      timestamp: lastPrompt.timestamp,
+    };
+  }
+
   return {
     messages: cache.list,
     total: cache.list.length,
     cachedAt: cache.timestamp,
+    lastUserPrompt,
   };
 }
 

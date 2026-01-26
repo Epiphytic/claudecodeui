@@ -65,6 +65,7 @@ import crypto from "crypto";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import os from "os";
+import { getSessionTitleFromHistory } from "./history-cache.js";
 
 // Import TaskMaster detection functions
 async function detectTaskMasterFolder(projectPath) {
@@ -879,9 +880,21 @@ async function parseJsonlSessions(filePath) {
     }
 
     // After processing all entries, set final summary based on last message if no summary exists
+    // Also try to get title from history.jsonl for better accuracy
     for (const session of sessions.values()) {
       if (session.summary === "New Session") {
-        // Prefer last user message, fall back to last assistant message
+        // First, try to get title from history.jsonl (most recent user prompt)
+        try {
+          const historyTitle = await getSessionTitleFromHistory(session.id);
+          if (historyTitle) {
+            session.summary = historyTitle;
+            continue;
+          }
+        } catch {
+          // History lookup failed, continue with fallback
+        }
+
+        // Fall back to last user message, then last assistant message
         const lastMessage =
           session.lastUserMessage || session.lastAssistantMessage;
         if (lastMessage) {
