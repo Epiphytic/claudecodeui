@@ -4596,18 +4596,19 @@ function ChatInterface({
     isSystemSessionChange,
   ]);
 
-  // External Message Update Handler: Reload messages when external CLI modifies current session
+  // External Message Update Handler: Incrementally load new messages when external CLI modifies current session
   // This triggers when App.jsx detects a JSONL file change for the currently-viewed session
-  // Only reloads if the session is NOT active (respecting Session Protection System)
+  // Only updates if the session is NOT active (respecting Session Protection System)
+  // Uses incremental loading to avoid full page reloads
   useEffect(() => {
     if (externalMessageUpdate > 0 && selectedSession && selectedProject) {
-      const reloadExternalMessages = async () => {
+      const loadNewExternalMessages = async () => {
         try {
           const provider =
             localStorage.getItem("selected-provider") || "claude";
 
           if (provider === "cursor") {
-            // Reload Cursor messages from SQLite
+            // Cursor: Full reload (SQLite-based, already efficient)
             const projectPath =
               selectedProject.fullPath || selectedProject.path;
             const converted = await loadCursorSessionMessages(
@@ -4617,39 +4618,102 @@ function ChatInterface({
             setSessionMessages([]);
             setChatMessages(converted);
           } else {
-            // Reload Claude/Codex messages from API/JSONL
-            const messages = await loadSessionMessages(
+            // Claude/Codex: Incremental load only NEW messages
+            // Get the current message list to check for new messages
+            const listResponse = await api.messagesList(
               selectedProject.name,
               selectedSession.id,
-              false,
-              selectedSession.__provider || "claude",
+              messageListCacheRef.current?.etag,
             );
-            setSessionMessages(messages);
-            // convertedMessages will be automatically updated via useMemo
 
-            // Smart scroll behavior: only auto-scroll if user is near bottom
-            const shouldAutoScroll = autoScrollToBottom && isNearBottom();
-            if (shouldAutoScroll) {
-              setTimeout(() => scrollToBottom(), 200);
+            if (listResponse.status === 304) {
+              // No changes - nothing to do
+              return;
             }
-            // If user scrolled up, preserve their position (they're reading history)
+
+            if (!listResponse.ok) {
+              console.error(
+                "Failed to fetch message list for incremental update",
+              );
+              return;
+            }
+
+            const listData = await listResponse.json();
+            const etag = listResponse.headers.get("etag");
+            const currentCount = lastKnownMessageNumberRef.current;
+
+            // Only fetch if there are new messages
+            if (listData.total > currentCount) {
+              // Find the first missing message number
+              let startNum = currentCount + 1;
+              while (
+                startNum <= listData.total &&
+                messageBodiesCacheRef.current.has(startNum)
+              ) {
+                startNum++;
+              }
+
+              // Fetch new messages in one range request
+              if (startNum <= listData.total) {
+                const rangeResponse = await api.messagesByRange(
+                  selectedProject.name,
+                  selectedSession.id,
+                  startNum,
+                  listData.total,
+                );
+                if (rangeResponse.ok) {
+                  const rangeData = await rangeResponse.json();
+                  for (const msg of rangeData.messages) {
+                    messageBodiesCacheRef.current.set(msg.number, msg);
+                  }
+                }
+              }
+
+              lastKnownMessageNumberRef.current = listData.total;
+
+              // Append only new messages (preserves existing messages in state)
+              const newMessages = [];
+              for (let i = currentCount + 1; i <= listData.total; i++) {
+                if (messageBodiesCacheRef.current.has(i)) {
+                  newMessages.push(messageBodiesCacheRef.current.get(i));
+                }
+              }
+
+              if (newMessages.length > 0) {
+                setSessionMessages((prev) => [...prev, ...newMessages]);
+                setTotalMessages(listData.total);
+
+                // Smart scroll: only auto-scroll if user is near bottom
+                const shouldAutoScroll = autoScrollToBottom && isNearBottom();
+                if (shouldAutoScroll) {
+                  setTimeout(() => scrollToBottom(), 200);
+                }
+              }
+
+              // Update cache
+              messageListCacheRef.current = {
+                messages: listData.messages,
+                total: listData.total,
+                etag,
+              };
+              messageListLastFetchedRef.current = Date.now();
+            }
           }
         } catch (error) {
           console.error(
-            "Error reloading messages from external update:",
+            "Error loading new messages from external update:",
             error,
           );
         }
       };
 
-      reloadExternalMessages();
+      loadNewExternalMessages();
     }
   }, [
     externalMessageUpdate,
     selectedSession,
     selectedProject,
     loadCursorSessionMessages,
-    loadSessionMessages,
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
