@@ -17,8 +17,8 @@ import { createLogger } from "./logger.js";
 
 const log = createLogger("process-cache");
 
-// Cache update interval (60 seconds)
-const CACHE_UPDATE_INTERVAL = 60 * 1000;
+// Cache update interval (5 minutes)
+const CACHE_UPDATE_INTERVAL = 5 * 60 * 1000;
 
 // Cached data structure
 const processCache = {

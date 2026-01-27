@@ -30,7 +30,7 @@ const messageBodyCache = new Map();
 
 // Cache limits
 const MAX_CACHED_SESSIONS = 20; // Maximum number of session lists to cache
-const MAX_CACHED_MESSAGES = 500; // Maximum number of full message bodies to cache
+const MAX_CACHED_MESSAGES = 100; // Maximum number of full message bodies to cache
 const LIST_CACHE_TTL = 60000; // 60 seconds for list
 const MESSAGE_CACHE_TTL = 1800000; // 30 minutes for individual messages
 

@@ -201,10 +201,11 @@ async function setupProjectsWatcher() {
       persistent: true,
       ignoreInitial: true, // Don't fire events for existing files on startup
       followSymlinks: false,
-      depth: 10, // Reasonable depth limit
+      usePolling: false,
+      depth: 2, // Reduced depth limit for performance
       awaitWriteFinish: {
-        stabilityThreshold: 100, // Wait 100ms for file to stabilize
-        pollInterval: 50,
+        stabilityThreshold: 500, // Wait 500ms for file to stabilize
+        pollInterval: 200,
       },
     });
 
