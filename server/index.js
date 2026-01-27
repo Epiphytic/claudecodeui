@@ -138,6 +138,13 @@ import {
 import { updateProjectsCache } from "./projects-cache.js";
 import { initializeDatabase, tmuxSessionsDb } from "./database/db.js";
 import {
+  getDatabase,
+  getProjectsFromDb,
+  getSessions as getSessionsFromDb,
+  getVersion,
+} from "./database.js";
+import { indexFile, indexAllProjects } from "./db-indexer.js";
+import {
   validateApiKey,
   authenticateToken,
   authenticateWebSocket,
@@ -227,12 +234,18 @@ async function setupProjectsWatcher() {
           // Clear project directory cache when files change
           clearProjectDirectoryCache();
 
-          // Get updated projects list
-          const updatedProjects = await getProjects();
+          // Use SQLite incremental indexing instead of full re-parse
+          // This only processes new bytes in the changed file
+          const indexResult = await indexFile(filePath);
+          log.debug({ filePath, indexResult }, "File indexed");
 
-          // Update sessions and projects caches with new projects data
-          updateSessionsCache(updatedProjects);
-          updateProjectsCache(updatedProjects);
+          // Get lightweight data from SQLite for client notification
+          // This is much cheaper than parsing all JSONL files
+          const projectsFromDb = getProjectsFromDb();
+
+          // Update in-memory caches from SQLite (for backward compatibility)
+          // TODO: Eventually remove these caches entirely
+          updateProjectsCache(projectsFromDb);
 
           // Clean up stale tmux session entries from database
           cleanupStaleTmuxSessions();
@@ -240,7 +253,7 @@ async function setupProjectsWatcher() {
           // Notify all connected clients about the project changes
           const updateMessage = JSON.stringify({
             type: "projects_updated",
-            projects: updatedProjects,
+            projects: projectsFromDb,
             timestamp: new Date().toISOString(),
             changeType: eventType,
             changedFile: path.relative(claudeProjectsPath, filePath),
@@ -254,7 +267,7 @@ async function setupProjectsWatcher() {
         } catch (error) {
           console.error("[ERROR] Error handling project changes:", error);
         }
-      }, 300); // 300ms debounce (slightly faster than before)
+      }, 2000); // 2 second debounce to reduce UI refresh frequency
     };
 
     // Set up event listeners
@@ -707,6 +720,14 @@ app.post("/api/system/update", authenticateToken, async (req, res) => {
 app.get("/api/projects", authenticateToken, async (req, res) => {
   try {
     const projects = await getProjects();
+
+    // Set cache headers - 5 min cache with revalidation (public for Cloudflare)
+    const version = getVersion("projects");
+    res.set({
+      "Cache-Control": "public, max-age=300, stale-while-revalidate=60",
+      ETag: `"projects-${version.version}"`,
+    });
+
     res.json(projects);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -848,9 +869,9 @@ app.get(
         return res.status(304).end();
       }
 
-      // Set caching headers - 60 second cache
+      // Set caching headers - 60 second cache (public for Cloudflare)
       res.set({
-        "Cache-Control": `private, max-age=${Math.floor(LIST_CACHE_TTL / 1000)}`,
+        "Cache-Control": `public, max-age=${Math.floor(LIST_CACHE_TTL / 1000)}, stale-while-revalidate=30`,
         ETag: currentETag,
       });
 
@@ -892,9 +913,9 @@ app.get(
         return res.status(304).end();
       }
 
-      // Set caching headers - 30 minute cache (messages don't change)
+      // Set caching headers - 30 minute cache (messages are immutable, public for Cloudflare)
       res.set({
-        "Cache-Control": `private, max-age=${Math.floor(MESSAGE_CACHE_TTL / 1000)}`,
+        "Cache-Control": `public, max-age=${Math.floor(MESSAGE_CACHE_TTL / 1000)}, immutable`,
         ETag: currentETag,
       });
 
@@ -939,9 +960,9 @@ app.get(
         endNum,
       );
 
-      // Set short cache - range queries are typically for initial load
+      // Set cache - range queries for initial load (public for Cloudflare)
       res.set({
-        "Cache-Control": "private, max-age=30",
+        "Cache-Control": "public, max-age=60, stale-while-revalidate=30",
       });
 
       res.json({ messages, start: startNum, end: endNum });
@@ -3232,22 +3253,53 @@ async function startServer() {
       );
       console.log("");
 
-      // Initialize sessions and projects caches with initial project data
+      // Initialize SQLite database and index all projects
       // NOTE: This must happen BEFORE starting the file watcher to avoid contention
       try {
-        const initialProjects = await getProjects();
-        updateSessionsCache(initialProjects);
-        updateProjectsCache(initialProjects);
+        console.log(`${c.info("[INFO]")} Initializing SQLite database...`);
+
+        // Initialize SQLite database connection
+        getDatabase();
+
+        // Run full indexing of all projects
+        // This is incremental - only processes changed/new files
+        const indexResult = await indexAllProjects();
+
+        if (indexResult.success) {
+          console.log(
+            `${c.ok("[OK]")} SQLite database indexed: ${indexResult.stats.projects} projects, ${indexResult.stats.sessions} sessions`,
+          );
+        } else {
+          console.warn(
+            `${c.warn("[WARN]")} Indexing incomplete: ${indexResult.error}`,
+          );
+        }
+
+        // Populate in-memory caches from SQLite (for backward compatibility)
+        // TODO: Eventually remove these caches and read directly from SQLite
+        const projectsFromDb = getProjectsFromDb();
+        updateProjectsCache(projectsFromDb);
+
         console.log(
-          `${c.ok("[OK]")} Sessions cache initialized with ${initialProjects.length} projects`,
-        );
-        console.log(
-          `${c.ok("[OK]")} Projects cache initialized with ${initialProjects.length} projects`,
+          `${c.ok("[OK]")} Caches initialized from SQLite with ${projectsFromDb.length} projects`,
         );
       } catch (cacheError) {
         console.warn(
-          `${c.warn("[WARN]")} Failed to initialize caches: ${cacheError.message}`,
+          `${c.warn("[WARN]")} Failed to initialize database: ${cacheError.message}`,
         );
+        // Fall back to legacy getProjects if SQLite fails
+        try {
+          const initialProjects = await getProjects();
+          updateSessionsCache(initialProjects);
+          updateProjectsCache(initialProjects);
+          console.log(
+            `${c.ok("[OK]")} Caches initialized (legacy) with ${initialProjects.length} projects`,
+          );
+        } catch (fallbackError) {
+          console.error(
+            `${c.warn("[ERROR]")} Cache initialization failed completely`,
+          );
+        }
       }
 
       // Start watching the projects folder for changes (after cache is initialized)
