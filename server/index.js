@@ -3214,10 +3214,8 @@ async function startServer() {
       );
       console.log("");
 
-      // Start watching the projects folder for changes
-      await setupProjectsWatcher();
-
       // Initialize sessions and projects caches with initial project data
+      // NOTE: This must happen BEFORE starting the file watcher to avoid contention
       try {
         const initialProjects = await getProjects();
         updateSessionsCache(initialProjects);
@@ -3228,20 +3226,23 @@ async function startServer() {
         console.log(
           `${c.ok("[OK]")} Projects cache initialized with ${initialProjects.length} projects`,
         );
-
-        // Clean up stale tmux session entries on startup
-        cleanupStaleTmuxSessions();
-
-        // Start the process cache updater for external session detection
-        startCacheUpdater();
-        console.log(
-          `${c.ok("[OK]")} Process cache started (updates every ${CACHE_UPDATE_INTERVAL / 1000}s)`,
-        );
       } catch (cacheError) {
         console.warn(
           `${c.warn("[WARN]")} Failed to initialize caches: ${cacheError.message}`,
         );
       }
+
+      // Start watching the projects folder for changes (after cache is initialized)
+      await setupProjectsWatcher();
+
+      // Clean up stale tmux session entries on startup
+      cleanupStaleTmuxSessions();
+
+      // Start the process cache updater for external session detection
+      startCacheUpdater();
+      console.log(
+        `${c.ok("[OK]")} Process cache started (updates every ${CACHE_UPDATE_INTERVAL / 1000}s)`,
+      );
     });
   } catch (error) {
     console.error("[ERROR] Failed to start server:", error);
