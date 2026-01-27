@@ -28,8 +28,8 @@ let historyCache = {
   timestamp: null,
 };
 
-// Cache TTL - 30 seconds (file changes frequently during active use)
-const HISTORY_CACHE_TTL = 30000;
+// Cache TTL - 60 seconds (reduces reload frequency during active use)
+const HISTORY_CACHE_TTL = 60000;
 
 /**
  * Get the history.jsonl file path
@@ -162,7 +162,7 @@ async function loadHistory() {
       timestamp: Date.now(),
     };
 
-    log.info(
+    log.debug(
       {
         totalEntries: entries.length,
         sessionCount: bySession.size,
