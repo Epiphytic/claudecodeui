@@ -66,6 +66,7 @@ async function processSessionFile(filePath, projectName) {
     let messageNumber = isIncremental ? fileState.message_count || 0 : 0;
     let lastActivity = null;
     let summary = "New Session";
+    let firstUserMessage = null;
     let cwd = null;
 
     // Stream the file from the start offset
@@ -89,6 +90,21 @@ async function processSessionFile(filePath, projectName) {
           // Handle summary entries (they don't have sessionId)
           if (entry.type === "summary" && entry.summary) {
             summary = entry.summary;
+          }
+
+          // Capture first user message as fallback title
+          if (
+            !firstUserMessage &&
+            entry.type === "user" &&
+            entry.message?.content
+          ) {
+            const content = entry.message.content;
+            // Handle both string and array content formats
+            if (typeof content === "string") {
+              firstUserMessage = content;
+            } else if (Array.isArray(content) && content[0]?.text) {
+              firstUserMessage = content[0].text;
+            }
           }
 
           if (entry.sessionId === sessionId) {
@@ -145,11 +161,24 @@ async function processSessionFile(filePath, projectName) {
       insertUuidMappingBatch(uuidMappings);
     }
 
+    // Use first user message as fallback if no summary
+    let finalSummary = summary;
+    if (summary === "New Session" && firstUserMessage) {
+      // Truncate long messages and clean up for display
+      finalSummary = firstUserMessage
+        .replace(/\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (finalSummary.length > 100) {
+        finalSummary = finalSummary.substring(0, 97) + "...";
+      }
+    }
+
     // Update session metadata
     upsertSession({
       id: sessionId,
       projectName,
-      summary,
+      summary: finalSummary,
       messageCount: messageNumber,
       lastActivity: lastActivity ? lastActivity.toISOString() : null,
       cwd,
