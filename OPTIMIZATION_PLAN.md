@@ -4,13 +4,122 @@
 
 This plan addresses high CPU and memory usage when the application is at rest (no active requests).
 
+**Critical Finding:** Memory grows from 300MB to 8GB because `getProjects()` loads ALL 659MB of session files into memory as JavaScript objects.
+
 ## Priority Order
 
+0. **getProjects/parseJsonlSessions Memory Leak (CRITICAL - Memory)**
 1. Chokidar File Watcher (HIGH - CPU)
 2. Message Body Cache Size (HIGH - Memory)
 3. Process Cache Updater (MEDIUM - CPU)
 4. History Cache (MEDIUM - Memory)
 5. Background Intervals (LOW-MEDIUM - CPU)
+
+---
+
+## 0. CRITICAL: getProjects Memory Leak
+
+**Files:** `server/projects.js` (lines 620-680, 737-880)
+
+**Root Cause Analysis:**
+
+- Total session files: **659 files** totaling **659MB**
+- Largest single file: **148MB** (30,504 messages)
+- `getProjectSessions()` loads ALL entries from ALL files into `allEntries` array
+- `parseJsonlSessions()` stores full message content when only metadata is needed
+- JavaScript object overhead: 659MB JSONL → **2-4GB+ in memory**
+
+**Current Code (problematic):**
+
+```javascript
+// In getProjectSessions (line 621, 635)
+const allEntries = [];
+for (const { file } of filesWithStats) {
+  const result = await parseJsonlSessions(jsonlFile);
+  allEntries.push(...result.entries); // Stores ALL entries from ALL files
+}
+
+// In parseJsonlSessions (line 753)
+entries.push(entry); // Stores FULL entry including message content
+```
+
+**Fix - Only extract what's needed:**
+
+```javascript
+// parseJsonlSessions should only extract metadata, not full content
+async function parseJsonlSessions(filePath) {
+  const sessions = new Map();
+  const uuidIndex = []; // Only store what's needed for timeline detection
+
+  for await (const line of rl) {
+    const entry = JSON.parse(line);
+
+    // Only store lightweight index data for timeline detection
+    if (entry.uuid && entry.sessionId) {
+      uuidIndex.push({
+        uuid: entry.uuid,
+        sessionId: entry.sessionId,
+        type: entry.type,
+        parentUuid: entry.parentUuid || null,
+      });
+    }
+
+    // Update session metadata (already done correctly)
+    if (entry.sessionId) {
+      // ... existing session tracking code ...
+    }
+  }
+
+  return { sessions: Array.from(sessions.values()), uuidIndex };
+}
+```
+
+**Alternative Fix - Stream processing without storage:**
+
+```javascript
+async function getProjectSessions(projectDir, options = {}) {
+  const allSessions = new Map();
+  const uuidToSessionMap = new Map();
+  const sessionToFirstUserMsgId = new Map();
+  const sessionGroups = new Map();
+
+  // Process each file in streaming fashion
+  for (const { file } of filesWithStats) {
+    const jsonlFile = path.join(projectDir, file);
+
+    // Stream process - don't store entries
+    await streamProcessSessionFile(jsonlFile, {
+      onSession: (session) => {
+        if (!allSessions.has(session.id)) {
+          allSessions.set(session.id, session);
+        }
+      },
+      onEntry: (entry) => {
+        // Build indexes incrementally without storing full entries
+        if (entry.uuid && entry.sessionId) {
+          uuidToSessionMap.set(entry.uuid, entry.sessionId);
+        }
+        if (entry.type === "user" && entry.parentUuid === null && entry.uuid) {
+          // Timeline detection logic
+        }
+      },
+    });
+  }
+}
+```
+
+**Expected Impact:**
+
+- Reduce memory from **8GB → 500MB** (95% reduction)
+- Faster startup (less GC pressure)
+
+**Implementation Steps:**
+
+1. [ ] Modify `parseJsonlSessions` to not store full entries
+2. [ ] Change return value to only include `{ sessions, uuidIndex }`
+3. [ ] Update `getProjectSessions` to use lightweight uuidIndex
+4. [ ] Remove `allEntries` array entirely
+5. [ ] Test with 148MB session file to verify memory stays low
 
 ---
 
