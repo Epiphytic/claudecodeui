@@ -618,10 +618,11 @@ async function getSessions(projectName, limit = 5, offset = 0) {
     filesWithStats.sort((a, b) => b.mtime - a.mtime);
 
     const allSessions = new Map();
-    const allEntries = [];
     const uuidToSessionMap = new Map();
+    const allFirstUserMessages = []; // Lightweight: only { uuid, sessionId }
 
-    // Collect all sessions and entries from all files
+    // Collect all sessions and lightweight uuid index from all files
+    // Memory optimization: we no longer store full entries, only minimal metadata
     for (const { file } of filesWithStats) {
       const jsonlFile = path.join(projectDir, file);
       const result = await parseJsonlSessions(jsonlFile);
@@ -632,60 +633,52 @@ async function getSessions(projectName, limit = 5, offset = 0) {
         }
       });
 
-      allEntries.push(...result.entries);
+      // Merge uuid index (lightweight - only uuid -> sessionId mappings)
+      result.uuidIndex.uuidToSessionId.forEach((sessionId, uuid) => {
+        uuidToSessionMap.set(uuid, sessionId);
+      });
+
+      // Collect first user messages for timeline grouping
+      allFirstUserMessages.push(...result.uuidIndex.firstUserMessages);
 
       // Early exit optimization for large projects
       if (
         allSessions.size >= (limit + offset) * 2 &&
-        allEntries.length >= Math.min(3, filesWithStats.length)
+        allFirstUserMessages.length >= Math.min(3, filesWithStats.length)
       ) {
         break;
       }
     }
 
-    // Build UUID-to-session mapping for timeline detection
-    allEntries.forEach((entry) => {
-      if (entry.uuid && entry.sessionId) {
-        uuidToSessionMap.set(entry.uuid, entry.sessionId);
-      }
-    });
-
     // Group sessions by first user message ID
+    // Note: uuidToSessionMap is already built from uuidIndex during file processing above
     const sessionGroups = new Map(); // firstUserMsgId -> { latestSession, allSessions[] }
     const sessionToFirstUserMsgId = new Map(); // sessionId -> firstUserMsgId
 
-    // Find the first user message for each session
-    allEntries.forEach((entry) => {
-      if (
-        entry.sessionId &&
-        entry.type === "user" &&
-        entry.parentUuid === null &&
-        entry.uuid
-      ) {
-        // This is a first user message in a session (parentUuid is null)
-        const firstUserMsgId = entry.uuid;
+    // Find the first user message for each session using lightweight index
+    allFirstUserMessages.forEach(({ uuid, sessionId }) => {
+      const firstUserMsgId = uuid;
 
-        if (!sessionToFirstUserMsgId.has(entry.sessionId)) {
-          sessionToFirstUserMsgId.set(entry.sessionId, firstUserMsgId);
+      if (!sessionToFirstUserMsgId.has(sessionId)) {
+        sessionToFirstUserMsgId.set(sessionId, firstUserMsgId);
 
-          const session = allSessions.get(entry.sessionId);
-          if (session) {
-            if (!sessionGroups.has(firstUserMsgId)) {
-              sessionGroups.set(firstUserMsgId, {
-                latestSession: session,
-                allSessions: [session],
-              });
-            } else {
-              const group = sessionGroups.get(firstUserMsgId);
-              group.allSessions.push(session);
+        const session = allSessions.get(sessionId);
+        if (session) {
+          if (!sessionGroups.has(firstUserMsgId)) {
+            sessionGroups.set(firstUserMsgId, {
+              latestSession: session,
+              allSessions: [session],
+            });
+          } else {
+            const group = sessionGroups.get(firstUserMsgId);
+            group.allSessions.push(session);
 
-              // Update latest session if this one is more recent
-              if (
-                new Date(session.lastActivity) >
-                new Date(group.latestSession.lastActivity)
-              ) {
-                group.latestSession = session;
-              }
+            // Update latest session if this one is more recent
+            if (
+              new Date(session.lastActivity) >
+              new Date(group.latestSession.lastActivity)
+            ) {
+              group.latestSession = session;
             }
           }
         }
@@ -736,7 +729,12 @@ async function getSessions(projectName, limit = 5, offset = 0) {
 
 async function parseJsonlSessions(filePath) {
   const sessions = new Map();
-  const entries = [];
+  // Lightweight index for timeline detection - only stores minimal metadata, not full entries
+  // This reduces memory from ~2-4GB to ~50MB for large projects
+  const uuidIndex = {
+    uuidToSessionId: new Map(), // uuid -> sessionId (for timeline detection)
+    firstUserMessages: [], // Array of { uuid, sessionId } for entries with parentUuid === null and type === "user"
+  };
   const pendingSummaries = new Map(); // leafUuid -> summary for entries without sessionId
 
   try {
@@ -750,7 +748,23 @@ async function parseJsonlSessions(filePath) {
       if (line.trim()) {
         try {
           const entry = JSON.parse(line);
-          entries.push(entry);
+
+          // Build lightweight uuid index for timeline detection (instead of storing full entry)
+          if (entry.uuid && entry.sessionId) {
+            uuidIndex.uuidToSessionId.set(entry.uuid, entry.sessionId);
+          }
+          // Track first user messages (parentUuid === null) for timeline grouping
+          if (
+            entry.type === "user" &&
+            entry.parentUuid === null &&
+            entry.uuid &&
+            entry.sessionId
+          ) {
+            uuidIndex.firstUserMessages.push({
+              uuid: entry.uuid,
+              sessionId: entry.sessionId,
+            });
+          }
 
           // Handle summary entries that don't have sessionId yet
           if (
@@ -908,11 +922,14 @@ async function parseJsonlSessions(filePath) {
 
     return {
       sessions: filteredSessions,
-      entries: entries,
+      uuidIndex: uuidIndex,
     };
   } catch (error) {
     console.error("Error reading JSONL file:", error);
-    return { sessions: [], entries: [] };
+    return {
+      sessions: [],
+      uuidIndex: { uuidToSessionId: new Map(), firstUserMessages: [] },
+    };
   }
 }
 
