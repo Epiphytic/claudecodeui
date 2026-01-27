@@ -103,7 +103,12 @@ import {
   abortCodexSession,
   isCodexSessionActive,
   getActiveCodexSessions,
+  cleanupCodexSessions,
 } from "./openai-codex.js";
+import {
+  registerTask,
+  setActive as setMaintenanceActive,
+} from "./maintenance-scheduler.js";
 import gitRoutes from "./routes/git.js";
 import authRoutes from "./routes/auth.js";
 import mcpRoutes from "./routes/mcp.js";
@@ -1414,8 +1419,10 @@ function handleChatConnection(ws) {
 
   // Add to connected clients for project updates
   connectedClients.add(ws);
-  // Activate process cache for more frequent updates
-  setProcessCacheActive(connectedClients.size > 0);
+  // Activate process cache and maintenance scheduler when clients are connected
+  const hasClients = connectedClients.size > 0;
+  setProcessCacheActive(hasClients);
+  setMaintenanceActive(hasClients);
 
   // Generate unique connection ID for orchestrator status tracking
   const connectionId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1437,8 +1444,10 @@ function handleChatConnection(ws) {
     console.log("🔌 Chat client disconnected");
     // Remove from connected clients
     connectedClients.delete(ws);
-    // Update process cache active state based on remaining clients
-    setProcessCacheActive(connectedClients.size > 0);
+    // Update process cache and maintenance scheduler based on remaining clients
+    const hasClients = connectedClients.size > 0;
+    setProcessCacheActive(hasClients);
+    setMaintenanceActive(hasClients);
     // Track disconnection for orchestrator status (if enabled)
     if (orchestratorStatusHooks) {
       orchestratorStatusHooks.onConnectionClose(connectionId);
@@ -3251,6 +3260,27 @@ async function startServer() {
       startCacheUpdater();
       console.log(
         `${c.ok("[OK]")} Process cache started (updates every ${CACHE_UPDATE_INTERVAL / 1000}s)`,
+      );
+
+      // Register maintenance tasks with centralized scheduler
+      // These tasks only run when WebSocket clients are connected
+      registerTask(
+        "session-lock-cleanup",
+        () => {
+          const cleaned = sessionLock.cleanupStaleLocks();
+          if (cleaned > 0) {
+            console.log(`[SessionLock] Cleaned up ${cleaned} stale locks`);
+          }
+        },
+        5 * 60 * 1000, // 5 minutes
+      );
+      registerTask(
+        "codex-session-cleanup",
+        cleanupCodexSessions,
+        5 * 60 * 1000,
+      );
+      console.log(
+        `${c.ok("[OK]")} Maintenance scheduler initialized (idle detection enabled)`,
       );
     });
   } catch (error) {
