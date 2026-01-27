@@ -17,8 +17,15 @@ import { createLogger } from "./logger.js";
 
 const log = createLogger("process-cache");
 
-// Cache update interval (5 minutes)
-const CACHE_UPDATE_INTERVAL = 5 * 60 * 1000;
+// Adaptive cache update intervals
+const IDLE_CACHE_UPDATE_INTERVAL = 5 * 60 * 1000; // 5 minutes when idle
+const ACTIVE_CACHE_UPDATE_INTERVAL = 60 * 1000; // 1 minute when active
+
+// Legacy export for compatibility
+const CACHE_UPDATE_INTERVAL = IDLE_CACHE_UPDATE_INTERVAL;
+
+// Active mode flag (active when WebSocket clients are connected)
+let isActiveMode = false;
 
 // Cached data structure
 const processCache = {
@@ -349,19 +356,55 @@ async function updateCache() {
 }
 
 /**
+ * Get the current update interval based on active mode
+ */
+function getCurrentInterval() {
+  return isActiveMode
+    ? ACTIVE_CACHE_UPDATE_INTERVAL
+    : IDLE_CACHE_UPDATE_INTERVAL;
+}
+
+/**
  * Start the background cache update loop
  */
 function startCacheUpdater() {
   // Perform initial update immediately
   updateCache();
 
-  // Schedule periodic updates
-  updateInterval = setInterval(updateCache, CACHE_UPDATE_INTERVAL);
+  // Schedule periodic updates (start in idle mode)
+  updateInterval = setInterval(updateCache, getCurrentInterval());
 
   log.info(
-    { intervalMs: CACHE_UPDATE_INTERVAL },
+    { intervalMs: getCurrentInterval(), isActiveMode },
     "Process cache updater started",
   );
+}
+
+/**
+ * Set the process cache active mode
+ * When active (WebSocket clients connected), updates more frequently
+ * @param {boolean} active - Whether the cache should be in active mode
+ */
+function setProcessCacheActive(active) {
+  if (isActiveMode === active) return;
+
+  isActiveMode = active;
+
+  // Restart the interval with the new timing
+  if (updateInterval) {
+    clearInterval(updateInterval);
+    updateInterval = setInterval(updateCache, getCurrentInterval());
+
+    log.info(
+      { isActiveMode, intervalMs: getCurrentInterval() },
+      "Process cache interval updated",
+    );
+
+    // If becoming active, do an immediate update
+    if (active) {
+      updateCache();
+    }
+  }
 }
 
 /**
@@ -411,5 +454,8 @@ export {
   getCachedProcessData,
   forceUpdate,
   getCacheAge,
+  setProcessCacheActive,
   CACHE_UPDATE_INTERVAL,
+  IDLE_CACHE_UPDATE_INTERVAL,
+  ACTIVE_CACHE_UPDATE_INTERVAL,
 };

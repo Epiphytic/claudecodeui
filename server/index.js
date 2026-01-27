@@ -87,7 +87,11 @@ import {
 } from "./tmux-manager.js";
 import { detectExternalClaude } from "./external-session-detector.js";
 import { createLogger } from "./logger.js";
-import { startCacheUpdater, CACHE_UPDATE_INTERVAL } from "./process-cache.js";
+import {
+  startCacheUpdater,
+  setProcessCacheActive,
+  CACHE_UPDATE_INTERVAL,
+} from "./process-cache.js";
 import {
   spawnCursor,
   abortCursorSession,
@@ -1410,6 +1414,8 @@ function handleChatConnection(ws) {
 
   // Add to connected clients for project updates
   connectedClients.add(ws);
+  // Activate process cache for more frequent updates
+  setProcessCacheActive(connectedClients.size > 0);
 
   // Generate unique connection ID for orchestrator status tracking
   const connectionId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1431,6 +1437,8 @@ function handleChatConnection(ws) {
     console.log("🔌 Chat client disconnected");
     // Remove from connected clients
     connectedClients.delete(ws);
+    // Update process cache active state based on remaining clients
+    setProcessCacheActive(connectedClients.size > 0);
     // Track disconnection for orchestrator status (if enabled)
     if (orchestratorStatusHooks) {
       orchestratorStatusHooks.onConnectionClose(connectionId);

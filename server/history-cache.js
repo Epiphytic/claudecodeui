@@ -6,8 +6,10 @@
  * - Supplement session titles with the last user prompt
  * - Provide user prompt history for a session
  *
- * The file is small (typically < 1000 lines) so it's parsed on-demand
- * with a short TTL cache.
+ * Uses lazy loading with LRU eviction:
+ * - Only caches sessions that have been accessed recently
+ * - Uses streaming to find entries for a specific session
+ * - Evicts least recently used sessions when cache is full
  */
 
 import fs from "fs";
@@ -19,17 +21,18 @@ import { createLogger } from "./logger.js";
 
 const log = createLogger("history-cache");
 
-// Cache storage
-let historyCache = {
-  entries: [], // All entries sorted by timestamp
-  bySession: new Map(), // sessionId -> entries[]
-  byProject: new Map(), // projectPath -> entries[]
-  mtime: null,
-  timestamp: null,
-};
+// LRU cache configuration
+const MAX_CACHED_SESSIONS = 20;
 
 // Cache TTL - 60 seconds (reduces reload frequency during active use)
 const HISTORY_CACHE_TTL = 60000;
+
+// LRU cache for session data
+// Map maintains insertion order, so we use it for LRU behavior
+const sessionCache = new Map(); // sessionId -> { entries: [], timestamp: number }
+
+// File modification time tracking (to invalidate cache when file changes)
+let lastFileMtime = null;
 
 /**
  * Get the history.jsonl file path
@@ -77,41 +80,55 @@ function parseHistoryEntry(line) {
 }
 
 /**
- * Load and parse the history.jsonl file
+ * Invalidate cache if file has changed
  */
-async function loadHistory() {
+async function checkFileChanged() {
   const filePath = getHistoryFilePath();
   const currentMtime = await getFileMtime(filePath);
 
-  // Check if cache is valid
-  if (
-    historyCache.timestamp &&
-    historyCache.mtime === currentMtime &&
-    Date.now() - historyCache.timestamp < HISTORY_CACHE_TTL
-  ) {
-    log.debug("Using cached history");
-    return historyCache;
+  if (currentMtime !== lastFileMtime) {
+    // File changed, clear all cached data
+    sessionCache.clear();
+    lastFileMtime = currentMtime;
+    log.debug({ mtime: currentMtime }, "History file changed, cache cleared");
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Move a session to the end of the LRU cache (most recently used)
+ * @param {string} sessionId
+ * @param {object} data
+ */
+function touchSession(sessionId, data) {
+  // Delete and re-add to move to end (most recently used)
+  sessionCache.delete(sessionId);
+  sessionCache.set(sessionId, data);
+
+  // Evict oldest entries if over limit
+  while (sessionCache.size > MAX_CACHED_SESSIONS) {
+    const oldestKey = sessionCache.keys().next().value;
+    sessionCache.delete(oldestKey);
+    log.debug({ sessionId: oldestKey }, "Evicted session from LRU cache");
+  }
+}
+
+/**
+ * Stream through history file and collect entries for a specific session
+ * @param {string} sessionId - The session ID to find
+ * @returns {Promise<Array>} Array of entries for the session
+ */
+async function streamEntriesForSession(sessionId) {
+  const filePath = getHistoryFilePath();
+
+  if (!fs.existsSync(filePath)) {
+    return [];
   }
 
-  log.debug("Loading history from file");
+  const entries = [];
 
   try {
-    const entries = [];
-    const bySession = new Map();
-    const byProject = new Map();
-
-    if (!fs.existsSync(filePath)) {
-      log.debug("History file does not exist");
-      historyCache = {
-        entries: [],
-        bySession: new Map(),
-        byProject: new Map(),
-        mtime: null,
-        timestamp: Date.now(),
-      };
-      return historyCache;
-    }
-
     const fileStream = fs.createReadStream(filePath);
     const rl = readline.createInterface({
       input: fileStream,
@@ -121,71 +138,55 @@ async function loadHistory() {
     for await (const line of rl) {
       if (line.trim()) {
         const entry = parseHistoryEntry(line);
-        if (entry) {
+        if (entry && entry.sessionId === sessionId) {
           entries.push(entry);
-
-          // Index by session
-          if (!bySession.has(entry.sessionId)) {
-            bySession.set(entry.sessionId, []);
-          }
-          bySession.get(entry.sessionId).push(entry);
-
-          // Index by project
-          if (entry.project) {
-            if (!byProject.has(entry.project)) {
-              byProject.set(entry.project, []);
-            }
-            byProject.get(entry.project).push(entry);
-          }
         }
       }
     }
 
-    // Sort all entries by timestamp
+    // Sort by timestamp
     entries.sort((a, b) => a.timestamp - b.timestamp);
 
-    // Sort entries within each session by timestamp
-    for (const [, sessionEntries] of bySession) {
-      sessionEntries.sort((a, b) => a.timestamp - b.timestamp);
-    }
-
-    // Sort entries within each project by timestamp
-    for (const [, projectEntries] of byProject) {
-      projectEntries.sort((a, b) => a.timestamp - b.timestamp);
-    }
-
-    historyCache = {
-      entries,
-      bySession,
-      byProject,
-      mtime: currentMtime,
-      timestamp: Date.now(),
-    };
-
     log.debug(
-      {
-        totalEntries: entries.length,
-        sessionCount: bySession.size,
-        projectCount: byProject.size,
-      },
-      "History loaded",
+      { sessionId, entryCount: entries.length },
+      "Streamed session entries",
     );
 
-    return historyCache;
+    return entries;
   } catch (error) {
-    log.error({ error: error.message }, "Failed to load history");
-    return historyCache;
+    log.error({ error: error.message, sessionId }, "Failed to stream session");
+    return [];
   }
 }
 
 /**
- * Get all prompts for a specific session
+ * Get all prompts for a specific session (with lazy loading and LRU caching)
  * @param {string} sessionId - The session ID
  * @returns {Promise<Array>} Array of prompt entries sorted by timestamp
  */
 async function getSessionPrompts(sessionId) {
-  const cache = await loadHistory();
-  return cache.bySession.get(sessionId) || [];
+  // Check if file has changed (invalidates cache)
+  await checkFileChanged();
+
+  // Check if session is in cache and still valid
+  const cached = sessionCache.get(sessionId);
+  if (cached && Date.now() - cached.timestamp < HISTORY_CACHE_TTL) {
+    // Move to end of LRU
+    touchSession(sessionId, cached);
+    log.debug({ sessionId }, "Using cached session prompts");
+    return cached.entries;
+  }
+
+  // Not in cache or expired, stream from file
+  const entries = await streamEntriesForSession(sessionId);
+
+  // Cache the result
+  touchSession(sessionId, {
+    entries,
+    timestamp: Date.now(),
+  });
+
+  return entries;
 }
 
 /**
@@ -201,12 +202,46 @@ async function getLastSessionPrompt(sessionId) {
 
 /**
  * Get all prompts for a specific project path
+ * Streams through file without caching (less common operation)
  * @param {string} projectPath - The project path
  * @returns {Promise<Array>} Array of prompt entries sorted by timestamp
  */
 async function getProjectPrompts(projectPath) {
-  const cache = await loadHistory();
-  return cache.byProject.get(projectPath) || [];
+  const filePath = getHistoryFilePath();
+
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  const entries = [];
+
+  try {
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      if (line.trim()) {
+        const entry = parseHistoryEntry(line);
+        if (entry && entry.project === projectPath) {
+          entries.push(entry);
+        }
+      }
+    }
+
+    // Sort by timestamp
+    entries.sort((a, b) => a.timestamp - b.timestamp);
+
+    return entries;
+  } catch (error) {
+    log.error(
+      { error: error.message, projectPath },
+      "Failed to get project prompts",
+    );
+    return [];
+  }
 }
 
 /**
@@ -251,24 +286,47 @@ async function getSessionTitleFromHistory(sessionId, maxLength = 100) {
 
 /**
  * Get all session IDs that have history entries
+ * Streams through file (not frequently used)
  * @returns {Promise<Array<string>>} Array of session IDs
  */
 async function getAllSessionIds() {
-  const cache = await loadHistory();
-  return Array.from(cache.bySession.keys());
+  const filePath = getHistoryFilePath();
+
+  if (!fs.existsSync(filePath)) {
+    return [];
+  }
+
+  const sessionIds = new Set();
+
+  try {
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+      if (line.trim()) {
+        const entry = parseHistoryEntry(line);
+        if (entry) {
+          sessionIds.add(entry.sessionId);
+        }
+      }
+    }
+
+    return Array.from(sessionIds);
+  } catch (error) {
+    log.error({ error: error.message }, "Failed to get all session IDs");
+    return [];
+  }
 }
 
 /**
  * Invalidate the history cache
  */
 function invalidateCache() {
-  historyCache = {
-    entries: [],
-    bySession: new Map(),
-    byProject: new Map(),
-    mtime: null,
-    timestamp: null,
-  };
+  sessionCache.clear();
+  lastFileMtime = null;
   log.debug("History cache invalidated");
 }
 
@@ -277,13 +335,9 @@ function invalidateCache() {
  */
 function getCacheStats() {
   return {
-    totalEntries: historyCache.entries.length,
-    sessionCount: historyCache.bySession.size,
-    projectCount: historyCache.byProject.size,
-    cacheAge: historyCache.timestamp
-      ? Date.now() - historyCache.timestamp
-      : null,
-    mtime: historyCache.mtime,
+    cachedSessions: sessionCache.size,
+    maxCachedSessions: MAX_CACHED_SESSIONS,
+    lastFileMtime,
   };
 }
 
@@ -296,4 +350,5 @@ export {
   invalidateCache,
   getCacheStats,
   HISTORY_CACHE_TTL,
+  MAX_CACHED_SESSIONS,
 };
