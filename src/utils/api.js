@@ -25,6 +25,9 @@ export const authenticatedFetch = (url, options = {}) => {
 
 // API endpoints
 export const api = {
+  // Environment info (public, no token required)
+  environment: () => fetch("/api/environment"),
+
   // Auth endpoints (no token required)
   auth: {
     status: () => fetch("/api/auth/status"),

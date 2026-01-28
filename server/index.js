@@ -561,6 +561,64 @@ app.use("/api", validateApiKey);
 // Authentication routes (public)
 app.use("/api/auth", authRoutes);
 
+// Environment info endpoint (public) - used by version checker
+app.get("/api/environment", async (req, res) => {
+  try {
+    const { execSync } = await import("child_process");
+    const serverDir = __dirname;
+
+    let isGitRepo = false;
+    let gitBranch = null;
+    let shouldCheckForUpdates = true;
+
+    // Check if server directory is a git repo
+    try {
+      execSync("git rev-parse --is-inside-work-tree", {
+        cwd: serverDir,
+        stdio: "pipe",
+      });
+      isGitRepo = true;
+
+      // Get current branch
+      const branchOutput = execSync("git rev-parse --abbrev-ref HEAD", {
+        cwd: serverDir,
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      gitBranch = branchOutput.trim();
+
+      // Only check for updates if on main/master branch
+      shouldCheckForUpdates = gitBranch === "main" || gitBranch === "master";
+    } catch {
+      // Not a git repo or git not available
+      // Likely running from npm/npx - should check for updates
+      shouldCheckForUpdates = true;
+    }
+
+    // Detect if running from npx (temporary directory)
+    const isNpx =
+      process.argv[1]?.includes("_npx") ||
+      process.argv[1]?.includes("npx-") ||
+      process.env.npm_execpath?.includes("npx");
+
+    res.json({
+      isGitRepo,
+      gitBranch,
+      shouldCheckForUpdates,
+      isNpx: isNpx || false,
+    });
+  } catch (error) {
+    console.error("Environment check error:", error);
+    // Default to checking for updates on error
+    res.json({
+      isGitRepo: false,
+      gitBranch: null,
+      shouldCheckForUpdates: true,
+      isNpx: false,
+    });
+  }
+});
+
 // Projects API Routes (protected)
 app.use("/api/projects", authenticateToken, projectsRoutes);
 
