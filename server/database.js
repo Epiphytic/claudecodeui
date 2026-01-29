@@ -759,6 +759,20 @@ function clearHistoryPrompts() {
 // ============================================================
 
 /**
+ * Get a project's cwd from its sessions
+ * Useful as a fallback when session files are skipped during indexing
+ */
+function getProjectCwdFromSessions(projectName) {
+  const database = getDatabase();
+  const row = database
+    .prepare(
+      `SELECT cwd FROM sessions WHERE project_name = ? AND cwd IS NOT NULL AND cwd != '' LIMIT 1`,
+    )
+    .get(projectName);
+  return row ? row.cwd : null;
+}
+
+/**
  * Get database statistics
  */
 function getStats() {
@@ -823,6 +837,7 @@ export {
   getSessionCount,
   getSession,
   updateSessionSummary,
+  getProjectCwdFromSessions,
   // Message index
   insertMessageIndex,
   insertMessageIndexBatch,

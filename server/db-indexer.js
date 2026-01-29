@@ -20,6 +20,7 @@ import {
   insertUuidMappingBatch,
   deleteSessionMessageIndexes,
   getStats,
+  getProjectCwdFromSessions,
 } from "./database.js";
 
 const log = createLogger("db-indexer");
@@ -268,6 +269,11 @@ async function indexProject(projectDir) {
           projectCwd = result.cwd;
         }
       }
+    }
+
+    // If no cwd was found from processing (e.g., all files skipped), try database
+    if (!projectCwd) {
+      projectCwd = getProjectCwdFromSessions(projectName);
     }
 
     // Generate display name from actual path (from session cwd)
