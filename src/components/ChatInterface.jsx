@@ -7356,7 +7356,8 @@ function ChatInterface({
           onTouchMove={handleScroll}
           className="flex-1 overflow-y-auto overflow-x-hidden px-0 py-3 sm:p-4 space-y-3 sm:space-y-4 relative"
         >
-          {isLoadingSessionMessages && chatMessages.length === 0 ? (
+          {chatMessages.length === 0 && (isLoadingSessionMessages || selectedSession || currentSessionId) ? (
+            // Show loading spinner when a session is selected but messages haven't loaded yet
             <div className="text-center text-gray-500 dark:text-gray-400 mt-8">
               <div className="flex items-center justify-center space-x-2">
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
