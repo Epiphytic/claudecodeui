@@ -58,6 +58,11 @@ import SessionStatusIndicator from "./SessionStatusIndicator";
 
 import { safeJsonParse } from "../lib/utils.js";
 
+// Generate unique IDs for messages to ensure stable React keys
+// Using a counter + timestamp for uniqueness without crypto dependency
+let messageIdCounter = 0;
+const generateMessageId = () => `msg-${Date.now()}-${++messageIdCounter}`;
+
 // Helper function to decode HTML entities in text
 function decodeHtmlEntities(text) {
   if (!text) return text;
@@ -3117,6 +3122,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: data.content,
               timestamp: Date.now(),
@@ -3129,6 +3135,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: `**Current Model**: ${data.current.model}\n\n**Available Models**:\n\nClaude: ${data.available.claude.join(", ")}\n\nCursor: ${data.available.cursor.join(", ")}`,
               timestamp: Date.now(),
@@ -3140,7 +3147,7 @@ function ChatInterface({
           const costMessage = `**Token Usage**: ${data.tokenUsage.used.toLocaleString()} / ${data.tokenUsage.total.toLocaleString()} (${data.tokenUsage.percentage}%)\n\n**Estimated Cost**:\n- Input: $${data.cost.input}\n- Output: $${data.cost.output}\n- **Total**: $${data.cost.total}\n\n**Model**: ${data.model}`;
           setChatMessages((prev) => [
             ...prev,
-            { role: "assistant", content: costMessage, timestamp: Date.now() },
+            { id: generateMessageId(), role: "assistant", content: costMessage, timestamp: Date.now() },
           ]);
           break;
         }
@@ -3150,6 +3157,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: statusMessage,
               timestamp: Date.now(),
@@ -3163,6 +3171,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⚠️ ${data.message}`,
                 timestamp: Date.now(),
@@ -3172,6 +3181,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `📝 ${data.message}\n\nPath: \`${data.path}\``,
                 timestamp: Date.now(),
@@ -3197,6 +3207,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⚠️ ${data.message}`,
                 timestamp: Date.now(),
@@ -3208,6 +3219,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⏪ ${data.message}`,
                 timestamp: Date.now(),
@@ -3239,6 +3251,7 @@ function ChatInterface({
         setChatMessages((prev) => [
           ...prev,
           {
+            id: generateMessageId(),
             role: "assistant",
             content: "❌ Command execution cancelled",
             timestamp: Date.now(),
@@ -3322,6 +3335,7 @@ function ChatInterface({
         setChatMessages((prev) => [
           ...prev,
           {
+            id: generateMessageId(),
             role: "assistant",
             content: `Error executing command: ${error.message}`,
             timestamp: Date.now(),
@@ -5215,6 +5229,7 @@ function ChatInterface({
                       last.content = (last.content || "") + chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -5248,6 +5263,7 @@ function ChatInterface({
                     last.content = (last.content || "") + chunk;
                   } else {
                     updated.push({
+                      id: generateMessageId(),
                       type: "assistant",
                       content: chunk,
                       timestamp: new Date(),
@@ -5349,6 +5365,7 @@ function ChatInterface({
                 setChatMessages((prev) => [
                   ...prev,
                   {
+                    id: generateMessageId(),
                     type: "assistant",
                     content: "",
                     timestamp: new Date(),
@@ -5368,6 +5385,7 @@ function ChatInterface({
                 setChatMessages((prev) => [
                   ...prev,
                   {
+                    id: generateMessageId(),
                     type: "assistant",
                     content: content,
                     timestamp: new Date(),
@@ -5387,6 +5405,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 type: "assistant",
                 content: content,
                 timestamp: new Date(),
@@ -5449,6 +5468,7 @@ function ChatInterface({
                         : chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -5467,6 +5487,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: latestMessage.data,
               timestamp: new Date(),
@@ -5530,6 +5551,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Error: ${latestMessage.error}`,
               timestamp: new Date(),
@@ -5587,6 +5609,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: `Using tool: ${latestMessage.tool} ${latestMessage.input ? `with ${latestMessage.input}` : ""}`,
               timestamp: new Date(),
@@ -5602,6 +5625,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Cursor error: ${latestMessage.error || "Unknown error"}`,
               timestamp: new Date(),
@@ -5663,6 +5687,7 @@ function ChatInterface({
                   last.isStreaming = false;
                 } else if (textResult && textResult.trim()) {
                   updated.push({
+                    id: generateMessageId(),
                     type: r.is_error ? "error" : "assistant",
                     content: textResult,
                     timestamp: new Date(),
@@ -5726,6 +5751,7 @@ function ChatInterface({
                         : chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -5814,6 +5840,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: content,
                         timestamp: new Date(),
@@ -5830,6 +5857,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: content,
                         timestamp: new Date(),
@@ -5844,6 +5872,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: "",
                         timestamp: new Date(),
@@ -5865,6 +5894,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: "",
                         timestamp: new Date(),
@@ -5881,6 +5911,7 @@ function ChatInterface({
                   setChatMessages((prev) => [
                     ...prev,
                     {
+                      id: generateMessageId(),
                       type: "assistant",
                       content: "",
                       timestamp: new Date(),
@@ -5899,6 +5930,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "error",
                         content: codexData.message.content,
                         timestamp: new Date(),
@@ -5928,6 +5960,7 @@ function ChatInterface({
               setChatMessages((prev) => [
                 ...prev,
                 {
+                  id: generateMessageId(),
                   type: "error",
                   content: codexData.error?.message || "Turn failed",
                   timestamp: new Date(),
@@ -5998,6 +6031,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: latestMessage.error || "An error occurred with Codex",
               timestamp: new Date(),
@@ -6033,6 +6067,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: "Session interrupted by user.",
               timestamp: new Date(),
@@ -6109,6 +6144,7 @@ function ChatInterface({
               setChatMessages((prev) => [
                 ...prev,
                 {
+                  id: generateMessageId(),
                   type: "error",
                   content:
                     "Connection timeout: No response from the server. The session may have ended unexpectedly.",
@@ -6511,6 +6547,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Failed to upload images: ${error.message}`,
               timestamp: new Date(),
@@ -6521,6 +6558,7 @@ function ChatInterface({
       }
 
       const userMessage = {
+        id: generateMessageId(),
         type: "user",
         content: input,
         images: uploadedImages,
@@ -6722,6 +6760,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Failed to upload images: ${error.message}`,
               timestamp: new Date(),
@@ -6732,6 +6771,7 @@ function ChatInterface({
       }
 
       const userMessage = {
+        id: generateMessageId(),
         type: "user",
         content: input,
         images: uploadedImages,
@@ -7655,7 +7695,7 @@ function ChatInterface({
 
                 return (
                   <MessageComponent
-                    key={index}
+                    key={message.id || message.blobId || `legacy-${index}`}
                     message={message}
                     index={index}
                     prevMessage={prevMessage}
