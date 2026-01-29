@@ -37,6 +37,8 @@ const DEFAULTS = {
   maxReconnectAttempts: 10,
   reconnectBackoffMultiplier: 1.5,
   maxReconnectInterval: 60000,
+  wakeCheckInterval: 5000, // Check for system wake every 5 seconds
+  wakeThreshold: 15000, // Consider it a wake event if timer was delayed by 15+ seconds
 };
 
 /**
@@ -96,6 +98,10 @@ export class OrchestratorClient extends EventEmitter {
     this.pendingMode = false;
     this.pendingId = null;
     this.orchestratorHost = null;
+
+    // System wake detection
+    this.wakeCheckTimer = null;
+    this.lastWakeCheck = Date.now();
   }
 
   /**
@@ -328,6 +334,7 @@ export class OrchestratorClient extends EventEmitter {
           // Send pending registration message
           this.sendPendingRegister();
           this.startHeartbeat();
+          this.startWakeDetection();
           resolve();
         });
 
@@ -404,6 +411,7 @@ export class OrchestratorClient extends EventEmitter {
     console.log("[ORCHESTRATOR] Disconnecting...");
     this.shouldReconnect = false;
     this.stopHeartbeat();
+    this.stopWakeDetection();
     this.clearReconnectTimer();
 
     if (this.ws) {
@@ -609,6 +617,7 @@ export class OrchestratorClient extends EventEmitter {
       console.log("[ORCHESTRATOR] Successfully registered with orchestrator");
       this.isRegistered = true;
       this.startHeartbeat();
+      this.startWakeDetection();
       this.emit("registered");
       this.emit("connected");
 
@@ -1237,6 +1246,7 @@ export class OrchestratorClient extends EventEmitter {
     this.isConnected = false;
     this.isRegistered = false;
     this.stopHeartbeat();
+    this.stopWakeDetection();
 
     // Try to close the socket, but don't wait for it
     if (this.ws) {
@@ -1281,6 +1291,48 @@ export class OrchestratorClient extends EventEmitter {
     if (this.heartbeatTimeoutTimer) {
       clearTimeout(this.heartbeatTimeoutTimer);
       this.heartbeatTimeoutTimer = null;
+    }
+  }
+
+  /**
+   * Starts system wake detection
+   * Detects when the system wakes from hibernation/sleep by monitoring timer delays
+   */
+  startWakeDetection() {
+    this.stopWakeDetection();
+    this.lastWakeCheck = Date.now();
+
+    this.wakeCheckTimer = setInterval(() => {
+      const now = Date.now();
+      const elapsed = now - this.lastWakeCheck;
+      this.lastWakeCheck = now;
+
+      // If the timer was delayed significantly, the system was likely sleeping
+      // Expected interval is 5000ms, so if we see 15000ms+ delay, it's a wake event
+      if (elapsed > DEFAULTS.wakeThreshold) {
+        console.log(
+          `[ORCHESTRATOR] System wake detected (timer delayed by ${elapsed}ms)`,
+        );
+
+        // If we think we're connected, force a reconnection
+        // The WebSocket is likely dead after hibernation
+        if (this.isConnected && this.ws) {
+          console.log(
+            "[ORCHESTRATOR] Forcing reconnection after system wake...",
+          );
+          this.forceReconnect();
+        }
+      }
+    }, DEFAULTS.wakeCheckInterval);
+  }
+
+  /**
+   * Stops system wake detection
+   */
+  stopWakeDetection() {
+    if (this.wakeCheckTimer) {
+      clearInterval(this.wakeCheckTimer);
+      this.wakeCheckTimer = null;
     }
   }
 
