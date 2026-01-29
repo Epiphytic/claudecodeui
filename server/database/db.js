@@ -97,6 +97,11 @@ const runMigrations = () => {
       );
     }
 
+    if (!columnNames.includes("avatar_url")) {
+      console.log("Running migration: Adding avatar_url column");
+      db.exec("ALTER TABLE users ADD COLUMN avatar_url TEXT");
+    }
+
     // Check if tmux_sessions table exists
     const tables = db
       .prepare(
@@ -214,7 +219,7 @@ const userDb = {
     try {
       const row = db
         .prepare(
-          "SELECT id, username, created_at, last_login FROM users WHERE id = ? AND is_active = 1",
+          "SELECT id, username, avatar_url, created_at, last_login FROM users WHERE id = ? AND is_active = 1",
         )
         .get(userId);
       return row;
@@ -227,7 +232,7 @@ const userDb = {
     try {
       const row = db
         .prepare(
-          "SELECT id, username, created_at, last_login FROM users WHERE is_active = 1 LIMIT 1",
+          "SELECT id, username, avatar_url, created_at, last_login FROM users WHERE is_active = 1 LIMIT 1",
         )
         .get();
       return row;
@@ -298,25 +303,28 @@ const userDb = {
         throw new Error("githubId is required and must be a non-empty string");
       }
 
+      // Construct avatar URL using our proxy endpoint for cacheability
+      const avatarUrl = `/api/avatar/${githubId}?s=80`;
+
       // First, try to find user by github_id (most authoritative)
       let user = db
         .prepare(
-          "SELECT id, username, github_id, created_at, last_login FROM users WHERE github_id = ? AND is_active = 1",
+          "SELECT id, username, github_id, avatar_url, created_at, last_login FROM users WHERE github_id = ? AND is_active = 1",
         )
         .get(githubId);
 
       if (user) {
-        // Found user by github_id, update last_login
+        // Found user by github_id, update last_login and avatar_url
         db.prepare(
-          "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?",
-        ).run(user.id);
-        return user;
+          "UPDATE users SET last_login = CURRENT_TIMESTAMP, avatar_url = ? WHERE id = ?",
+        ).run(avatarUrl, user.id);
+        return { ...user, avatar_url: avatarUrl };
       }
 
       // No user found by github_id, check if username exists
       const existingByUsername = db
         .prepare(
-          "SELECT id, username, github_id, created_at, last_login FROM users WHERE username = ? AND is_active = 1",
+          "SELECT id, username, github_id, avatar_url, created_at, last_login FROM users WHERE username = ? AND is_active = 1",
         )
         .get(githubUsername);
 
@@ -333,13 +341,14 @@ const userDb = {
           const passwordHash = await bcrypt.hash(randomPassword, 12);
 
           const stmt = db.prepare(
-            "INSERT INTO users (username, password_hash, github_id, has_completed_onboarding, last_login) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
+            "INSERT INTO users (username, password_hash, github_id, avatar_url, has_completed_onboarding, last_login) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
           );
-          const result = stmt.run(namespacedUsername, passwordHash, githubId);
+          const result = stmt.run(namespacedUsername, passwordHash, githubId, avatarUrl);
           user = {
             id: result.lastInsertRowid,
             username: namespacedUsername,
             github_id: githubId,
+            avatar_url: avatarUrl,
           };
           console.log(
             `[ORCHESTRATOR] Created namespaced user for orchestrator auth: ${namespacedUsername} (GitHub ID: ${githubId})`,
@@ -347,14 +356,14 @@ const userDb = {
           return user;
         }
 
-        // Username exists with no github_id or matching github_id - bind the github_id
+        // Username exists with no github_id or matching github_id - bind the github_id and avatar
         db.prepare(
-          "UPDATE users SET github_id = ?, last_login = CURRENT_TIMESTAMP WHERE id = ?",
-        ).run(githubId, existingByUsername.id);
+          "UPDATE users SET github_id = ?, avatar_url = ?, last_login = CURRENT_TIMESTAMP WHERE id = ?",
+        ).run(githubId, avatarUrl, existingByUsername.id);
         console.log(
           `[ORCHESTRATOR] Bound github_id ${githubId} to existing user: ${githubUsername}`,
         );
-        return { ...existingByUsername, github_id: githubId };
+        return { ...existingByUsername, github_id: githubId, avatar_url: avatarUrl };
       }
 
       // No existing user found, create new one
@@ -362,13 +371,14 @@ const userDb = {
       const passwordHash = await bcrypt.hash(randomPassword, 12);
 
       const stmt = db.prepare(
-        "INSERT INTO users (username, password_hash, github_id, has_completed_onboarding, last_login) VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
+        "INSERT INTO users (username, password_hash, github_id, avatar_url, has_completed_onboarding, last_login) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)",
       );
-      const result = stmt.run(githubUsername, passwordHash, githubId);
+      const result = stmt.run(githubUsername, passwordHash, githubId, avatarUrl);
       user = {
         id: result.lastInsertRowid,
         username: githubUsername,
         github_id: githubId,
+        avatar_url: avatarUrl,
       };
       console.log(
         `[ORCHESTRATOR] Created new user for orchestrator auth: ${githubUsername} (GitHub ID: ${githubId})`,

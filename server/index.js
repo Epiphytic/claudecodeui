@@ -1046,6 +1046,42 @@ app.put(
   },
 );
 
+// Avatar proxy endpoint - serves GitHub avatars with aggressive caching for Cloudflare
+app.get("/api/avatar/:githubId", authenticateToken, async (req, res) => {
+  try {
+    const { githubId } = req.params;
+    const size = req.query.s || "80";
+
+    // Validate githubId (should be numeric)
+    if (!/^\d+$/.test(githubId)) {
+      return res.status(400).json({ error: "Invalid GitHub ID" });
+    }
+
+    // Fetch from GitHub
+    const githubUrl = `https://avatars.githubusercontent.com/u/${githubId}?s=${size}&v=4`;
+    const response = await fetch(githubUrl);
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Avatar not found" });
+    }
+
+    // Set cache headers for aggressive caching (1 year, public for Cloudflare)
+    res.set({
+      "Content-Type": response.headers.get("content-type") || "image/png",
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "CDN-Cache-Control": "public, max-age=31536000",
+      "Cloudflare-CDN-Cache-Control": "public, max-age=31536000",
+    });
+
+    // Pipe the avatar to the response
+    const buffer = await response.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    console.error("[AvatarProxy] Error:", error.message);
+    res.status(500).json({ error: "Failed to fetch avatar" });
+  }
+});
+
 // Delete session endpoint
 app.delete(
   "/api/projects/:projectName/sessions/:sessionId",

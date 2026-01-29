@@ -60,14 +60,14 @@ router.post('/register', async (req, res) => {
       
       res.json({
         success: true,
-        user: { id: user.id, username: user.username },
+        user: { id: user.id, username: user.username, avatarUrl: user.avatar_url || null },
         token
       });
     } catch (error) {
       db.prepare('ROLLBACK').run();
       throw error;
     }
-    
+
   } catch (error) {
     console.error('Registration error:', error);
     if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
@@ -82,33 +82,33 @@ router.post('/register', async (req, res) => {
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    
+
     // Validate input
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
     }
-    
+
     // Get user from database
     const user = userDb.getUserByUsername(username);
     if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
-    
+
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
-    
+
     // Generate token
     const token = generateToken(user);
-    
+
     // Update last login
     userDb.updateLastLogin(user.id);
-    
+
     res.json({
       success: true,
-      user: { id: user.id, username: user.username },
+      user: { id: user.id, username: user.username, avatarUrl: user.avatar_url || null },
       token
     });
     
@@ -120,9 +120,15 @@ router.post('/login', async (req, res) => {
 
 // Get current user (protected route)
 router.get('/user', authenticateToken, (req, res) => {
-  res.json({
-    user: req.user
-  });
+  // Transform snake_case to camelCase for frontend consistency
+  const user = {
+    id: req.user.id,
+    username: req.user.username,
+    avatarUrl: req.user.avatar_url || null,
+    createdAt: req.user.created_at,
+    lastLogin: req.user.last_login,
+  };
+  res.json({ user });
 });
 
 // Logout (client-side token removal, but this endpoint can be used for logging)

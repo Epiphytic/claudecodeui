@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS users (
     git_name TEXT,
     git_email TEXT,
     has_completed_onboarding BOOLEAN DEFAULT 0,
-    github_id TEXT UNIQUE
+    github_id TEXT UNIQUE,
+    avatar_url TEXT
 );
 
 -- Indexes for performance

@@ -25,6 +25,7 @@ import React, {
   useLayoutEffect,
   memo,
 } from "react";
+import { useAuth } from "../contexts/AuthContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -632,6 +633,7 @@ const MessageComponent = memo(
     showThinking,
     selectedProject,
     provider,
+    user,
   }) => {
     const isGrouped =
       prevMessage &&
@@ -717,9 +719,17 @@ const MessageComponent = memo(
               </div>
             </div>
             {!isGrouped && (
-              <div className="hidden sm:flex w-8 h-8 bg-blue-600 rounded-full items-center justify-center text-white text-sm flex-shrink-0">
-                U
-              </div>
+              user?.avatarUrl ? (
+                <img
+                  src={user.avatarUrl}
+                  alt={user.username || "User"}
+                  className="hidden sm:block w-8 h-8 rounded-full flex-shrink-0 object-cover"
+                />
+              ) : (
+                <div className="hidden sm:flex w-8 h-8 bg-blue-600 rounded-full items-center justify-center text-white text-sm flex-shrink-0">
+                  U
+                </div>
+              )
             )}
           </div>
         ) : (
@@ -2778,6 +2788,7 @@ function ChatInterface({
   onTaskClick,
   onShowAllTasks,
 }) {
+  const { user } = useAuth();
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
   const [input, setInput] = useState(() => {
     if (typeof window !== "undefined" && selectedProject) {
@@ -3644,23 +3655,29 @@ function ChatInterface({
           const listData = await listResponse.json();
           const totalCount = listData.total;
 
-          // Use range endpoint to fetch all new messages at once
-          const rangeResponse = await api.messagesByRange(
-            projectName,
-            sessionId,
-            nextNumber,
-            totalCount,
-          );
-
+          // Fetch new messages in chunks of 100 (API limit)
           const newMessages = [];
-          if (rangeResponse.ok) {
-            const rangeData = await rangeResponse.json();
-            for (const msg of rangeData.messages) {
-              messageBodiesCacheRef.current.set(msg.number, msg);
-              newMessages.push(msg);
+          for (let start = nextNumber; start <= totalCount; start += 100) {
+            const end = Math.min(start + 99, totalCount);
+            const rangeResponse = await api.messagesByRange(
+              projectName,
+              sessionId,
+              start,
+              end,
+            );
+
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                messageBodiesCacheRef.current.set(msg.number, msg);
+                newMessages.push(msg);
+              }
             }
-          } else {
-            // Fallback: use the single message we already fetched
+          }
+
+          // Fallback if no messages were fetched via range
+          if (newMessages.length === 0) {
+            // Use the single message we already fetched
             const data = await response.json();
             messageBodiesCacheRef.current.set(data.number, data.message);
             newMessages.push(data.message);
@@ -4689,18 +4706,21 @@ function ChatInterface({
                 startNum++;
               }
 
-              // Fetch new messages in one range request
+              // Fetch new messages in chunks of 100 (API limit)
               if (startNum <= listData.total) {
-                const rangeResponse = await api.messagesByRange(
-                  selectedProject.name,
-                  selectedSession.id,
-                  startNum,
-                  listData.total,
-                );
-                if (rangeResponse.ok) {
-                  const rangeData = await rangeResponse.json();
-                  for (const msg of rangeData.messages) {
-                    messageBodiesCacheRef.current.set(msg.number, msg);
+                for (let chunkStart = startNum; chunkStart <= listData.total; chunkStart += 100) {
+                  const chunkEnd = Math.min(chunkStart + 99, listData.total);
+                  const rangeResponse = await api.messagesByRange(
+                    selectedProject.name,
+                    selectedSession.id,
+                    chunkStart,
+                    chunkEnd,
+                  );
+                  if (rangeResponse.ok) {
+                    const rangeData = await rangeResponse.json();
+                    for (const msg of rangeData.messages) {
+                      messageBodiesCacheRef.current.set(msg.number, msg);
+                    }
                   }
                 }
               }
@@ -4839,18 +4859,21 @@ function ChatInterface({
                   startNum++;
                 }
 
-                // Fetch all missing messages in one range request
+                // Fetch all missing messages in chunks of 100 (API limit)
                 if (startNum <= listData.total) {
-                  const rangeResponse = await api.messagesByRange(
-                    selectedProject.name,
-                    selectedSession.id,
-                    startNum,
-                    listData.total,
-                  );
-                  if (rangeResponse.ok) {
-                    const rangeData = await rangeResponse.json();
-                    for (const msg of rangeData.messages) {
-                      messageBodiesCacheRef.current.set(msg.number, msg);
+                  for (let chunkStart = startNum; chunkStart <= listData.total; chunkStart += 100) {
+                    const chunkEnd = Math.min(chunkStart + 99, listData.total);
+                    const rangeResponse = await api.messagesByRange(
+                      selectedProject.name,
+                      selectedSession.id,
+                      chunkStart,
+                      chunkEnd,
+                    );
+                    if (rangeResponse.ok) {
+                      const rangeData = await rangeResponse.json();
+                      for (const msg of rangeData.messages) {
+                        messageBodiesCacheRef.current.set(msg.number, msg);
+                      }
                     }
                   }
                 }
@@ -4948,19 +4971,22 @@ function ChatInterface({
         const listData = await listResponse.json();
         const etag = listResponse.headers.get("etag");
 
-        // Fetch any missing messages using range endpoint
+        // Fetch any missing messages using range endpoint (in chunks of 100)
         const currentCount = lastKnownMessageNumberRef.current;
         if (listData.total > currentCount) {
-          const rangeResponse = await api.messagesByRange(
-            selectedProject.name,
-            selectedSession.id,
-            currentCount + 1,
-            listData.total,
-          );
-          if (rangeResponse.ok) {
-            const rangeData = await rangeResponse.json();
-            for (const msg of rangeData.messages) {
-              messageBodiesCacheRef.current.set(msg.number, msg);
+          for (let chunkStart = currentCount + 1; chunkStart <= listData.total; chunkStart += 100) {
+            const chunkEnd = Math.min(chunkStart + 99, listData.total);
+            const rangeResponse = await api.messagesByRange(
+              selectedProject.name,
+              selectedSession.id,
+              chunkStart,
+              chunkEnd,
+            );
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                messageBodiesCacheRef.current.set(msg.number, msg);
+              }
             }
           }
           lastKnownMessageNumberRef.current = listData.total;
@@ -7689,6 +7715,7 @@ function ChatInterface({
                     showThinking={showThinking}
                     selectedProject={selectedProject}
                     provider={provider}
+                    user={user}
                   />
                 );
               })}
