@@ -6678,6 +6678,205 @@ function ChatInterface({
     ],
   );
 
+  // Handle forking to a new session - similar to handleSubmit but always starts fresh
+  const handleFork = useCallback(
+    async (e) => {
+      e.preventDefault();
+      if (!input.trim() || isLoading || !selectedProject) return;
+
+      // Apply thinking mode prefix if selected
+      let messageContent = input;
+      const selectedThinkingMode = thinkingModes.find(
+        (mode) => mode.id === thinkingMode,
+      );
+      if (selectedThinkingMode && selectedThinkingMode.prefix) {
+        messageContent = `${selectedThinkingMode.prefix}: ${input}`;
+      }
+
+      // Upload images first if any
+      let uploadedImages = [];
+      if (attachedImages.length > 0) {
+        const formData = new FormData();
+        attachedImages.forEach((file) => {
+          formData.append("images", file);
+        });
+
+        try {
+          const response = await authenticatedFetch(
+            `/api/projects/${encodeURIComponent(selectedProject.name)}/upload-images`,
+            {
+              method: "POST",
+              headers: {},
+              body: formData,
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error("Failed to upload images");
+          }
+
+          const result = await response.json();
+          uploadedImages = result.images;
+        } catch (error) {
+          console.error("Image upload failed:", error);
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              type: "error",
+              content: `Failed to upload images: ${error.message}`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+      }
+
+      const userMessage = {
+        type: "user",
+        content: input,
+        images: uploadedImages,
+        timestamp: new Date(),
+      };
+
+      // Clear existing messages since we're starting a new session
+      setChatMessages([userMessage]);
+      setIsLoading(true);
+      setCanAbortSession(true);
+      setClaudeStatus({
+        text: "Starting new session",
+        tokens: 0,
+        can_interrupt: true,
+      });
+
+      // Clear current session ID since we're forking
+      setCurrentSessionId(null);
+      setIsUserScrolledUp(false);
+      setTimeout(() => scrollToBottom(), 100);
+
+      // Create a temporary session placeholder for protection
+      const tempSessionId = `forked-session-${Date.now()}`;
+      if (onSessionActive) {
+        onSessionActive(tempSessionId);
+      }
+
+      // Get tools settings
+      const getToolsSettings = () => {
+        try {
+          const settingsKey =
+            provider === "cursor"
+              ? "cursor-tools-settings"
+              : provider === "codex"
+                ? "codex-settings"
+                : "claude-settings";
+          const savedSettings = safeLocalStorage.getItem(settingsKey);
+          if (savedSettings) {
+            return JSON.parse(savedSettings);
+          }
+        } catch (error) {
+          console.error("Error loading tools settings:", error);
+        }
+        return {
+          allowedTools: [],
+          disallowedTools: [],
+          skipPermissions: false,
+        };
+      };
+
+      const toolsSettings = getToolsSettings();
+
+      // Send command WITHOUT session ID to start fresh
+      if (provider === "cursor") {
+        sendMessage({
+          type: "cursor-command",
+          command: input,
+          sessionId: null, // No session - start fresh
+          options: {
+            cwd: selectedProject.fullPath || selectedProject.path,
+            projectPath: selectedProject.fullPath || selectedProject.path,
+            sessionId: null,
+            resume: false, // Don't resume - start new
+            model: cursorModel,
+            skipPermissions: toolsSettings?.skipPermissions || false,
+            toolsSettings: toolsSettings,
+          },
+        });
+      } else if (provider === "codex") {
+        sendMessage({
+          type: "codex-command",
+          command: input,
+          sessionId: null,
+          options: {
+            cwd: selectedProject.fullPath || selectedProject.path,
+            projectPath: selectedProject.fullPath || selectedProject.path,
+            sessionId: null,
+            resume: false,
+            model: codexModel,
+            permissionMode:
+              permissionMode === "plan" ? "default" : permissionMode,
+          },
+        });
+      } else {
+        // Claude - send without session ID
+        sendMessage({
+          type: "claude-command",
+          command: input,
+          options: {
+            projectPath: selectedProject.path,
+            cwd: selectedProject.fullPath,
+            sessionId: null, // No session - start fresh
+            resume: false, // Don't resume
+            toolsSettings: toolsSettings,
+            permissionMode: permissionMode,
+            model: claudeModel,
+            images: uploadedImages,
+          },
+        });
+      }
+
+      setInput("");
+      setAttachedImages([]);
+      setUploadingImages(new Map());
+      setImageErrors(new Map());
+      setIsTextareaExpanded(false);
+      setThinkingMode("none");
+
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "auto";
+      }
+
+      if (selectedProject) {
+        safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
+      }
+    },
+    [
+      input,
+      isLoading,
+      selectedProject,
+      attachedImages,
+      provider,
+      permissionMode,
+      onSessionActive,
+      cursorModel,
+      claudeModel,
+      codexModel,
+      sendMessage,
+      setInput,
+      setAttachedImages,
+      setUploadingImages,
+      setImageErrors,
+      setIsTextareaExpanded,
+      textareaRef,
+      setChatMessages,
+      setIsLoading,
+      setCanAbortSession,
+      setClaudeStatus,
+      setIsUserScrolledUp,
+      scrollToBottom,
+      setCurrentSessionId,
+      thinkingMode,
+    ],
+  );
+
   const handleGrantToolPermission = useCallback(
     (suggestion) => {
       if (!suggestion || provider !== "claude") {
@@ -8053,6 +8252,36 @@ function ChatInterface({
                   className="w-10 h-10 sm:w-10 sm:h-10"
                 />
               </div>
+
+              {/* Fork button - starts a new session */}
+              <button
+                type="button"
+                disabled={!input.trim() || isLoading}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  handleFork(e);
+                }}
+                onTouchStart={(e) => {
+                  e.preventDefault();
+                  handleFork(e);
+                }}
+                title="Fork: Start new session with this prompt"
+                className="absolute right-16 top-1/2 transform -translate-y-1/2 w-10 h-10 sm:w-10 sm:h-10 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 dark:ring-offset-gray-800"
+              >
+                <svg
+                  className="w-4 h-4 sm:w-5 sm:h-5 text-white"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"
+                  />
+                </svg>
+              </button>
 
               {/* Send button */}
               <button

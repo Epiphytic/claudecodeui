@@ -77,6 +77,7 @@ function isExternalClaudeProcess(command) {
 
 /**
  * Detect Claude processes on the system
+ * Uses efficient batch lsof call instead of per-process calls
  * @returns {{ processes: Array, detectionAvailable: boolean, error: string | null }}
  */
 function scanClaudeProcesses() {
@@ -121,7 +122,7 @@ function scanClaudeProcesses() {
       error = `Windows process detection failed: ${e.message}`;
     }
   } else {
-    // Unix: use pgrep and ps
+    // Unix: use pgrep and efficient batch lsof
     try {
       const pgrepCheck = spawnSync("which", ["pgrep"], {
         encoding: "utf8",
@@ -167,62 +168,113 @@ function scanClaudeProcesses() {
           error = `Process detection failed: ${e.message}`;
         }
       } else {
-        // pgrep is available
+        // pgrep is available - get all PIDs at once
         const pgrepResult = spawnSync("pgrep", ["-f", "claude"], {
           encoding: "utf8",
           stdio: "pipe",
         });
 
         if (pgrepResult.status === 0) {
-          const pids = pgrepResult.stdout.trim().split("\n").filter(Boolean);
-          log.debug({ pids }, "pgrep found PIDs");
+          const allPids = pgrepResult.stdout.trim().split("\n").filter(Boolean);
+          const pids = allPids
+            .map((p) => parseInt(p, 10))
+            .filter((p) => p !== currentPid);
 
-          for (const pidStr of pids) {
-            const pid = parseInt(pidStr, 10);
+          log.debug({ foundPids: allPids.length, filteredPids: pids.length }, "pgrep found PIDs");
 
-            if (pid === currentPid) {
-              log.debug({ pid }, "Skipping own PID");
-              continue;
+          if (pids.length === 0) {
+            return { processes, detectionAvailable, error };
+          }
+
+          // Get command details for all PIDs in a single ps call
+          const psResult = spawnSync(
+            "ps",
+            ["-p", pids.join(","), "-o", "pid=,args="],
+            {
+              encoding: "utf8",
+              stdio: "pipe",
+            },
+          );
+
+          // Build a map of PID -> command, filtering to only external Claude processes
+          const pidCommands = new Map();
+          if (psResult.status === 0) {
+            const lines = psResult.stdout.trim().split("\n").filter(Boolean);
+            for (const line of lines) {
+              const match = line.match(/^\s*(\d+)\s+(.+)$/);
+              if (match) {
+                const pid = parseInt(match[1], 10);
+                const command = match[2];
+                if (isExternalClaudeProcess(command)) {
+                  pidCommands.set(pid, command);
+                }
+              }
             }
+          }
 
-            // Get command details
-            const psResult = spawnSync(
-              "ps",
-              ["-p", String(pid), "-o", "args="],
+          if (pidCommands.size === 0) {
+            log.debug("No external Claude processes after filtering");
+            return { processes, detectionAvailable, error };
+          }
+
+          // Get cwds for all valid PIDs in a SINGLE lsof call
+          // Using -d cwd to only get cwd file descriptors (much faster than full file list)
+          // Note: lsof -d cwd returns ALL processes; we filter by our PIDs afterward
+          const validPids = new Set(pidCommands.keys());
+          const cwdMap = new Map();
+
+          try {
+            const lsofResult = spawnSync(
+              "lsof",
+              ["-d", "cwd", "-Fn"],
               {
                 encoding: "utf8",
                 stdio: "pipe",
+                timeout: 10000, // 10 second timeout
               },
             );
 
-            if (psResult.status === 0) {
-              const command = psResult.stdout.trim();
+            if (lsofResult.status === 0) {
+              // Parse lsof output: p<pid>\nfcwd\nn<path>\n format
+              // Filter to only the PIDs we care about
+              const lines = lsofResult.stdout.split("\n");
+              let currentPid = null;
+              let isCwdEntry = false;
 
-              if (isExternalClaudeProcess(command)) {
-                // Try to get working directory via lsof
-                let cwd = null;
-                try {
-                  const lsofResult = spawnSync(
-                    "lsof",
-                    ["-p", String(pid), "-Fn"],
-                    {
-                      encoding: "utf8",
-                      stdio: "pipe",
-                    },
-                  );
-                  if (lsofResult.status === 0) {
-                    const cwdMatch = lsofResult.stdout.match(/n(\/[^\n]+)/);
-                    if (cwdMatch) {
-                      cwd = cwdMatch[1];
+              for (const line of lines) {
+                if (line.startsWith("p")) {
+                  currentPid = parseInt(line.slice(1), 10);
+                  isCwdEntry = false;
+                } else if (line === "fcwd") {
+                  isCwdEntry = true;
+                } else if (line.startsWith("n") && currentPid && isCwdEntry) {
+                  // Only capture cwd for our target PIDs
+                  if (validPids.has(currentPid)) {
+                    const path = line.slice(1);
+                    if (path.startsWith("/")) {
+                      cwdMap.set(currentPid, path);
                     }
                   }
-                } catch {
-                  // lsof may not be available
+                  isCwdEntry = false;
                 }
-
-                processes.push({ pid, command, cwd });
               }
+
+              log.debug(
+                { targetPids: validPids.size, cwdsFound: cwdMap.size },
+                "Batch lsof complete",
+              );
             }
+          } catch {
+            log.debug("lsof not available for cwd detection");
+          }
+
+          // Build final process list
+          for (const [pid, command] of pidCommands) {
+            processes.push({
+              pid,
+              command,
+              cwd: cwdMap.get(pid) || null,
+            });
           }
         } else {
           log.debug({ status: pgrepResult.status }, "pgrep found no processes");
