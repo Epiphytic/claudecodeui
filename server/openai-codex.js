@@ -13,7 +13,7 @@
  * - getActiveCodexSessions() - List all active sessions
  */
 
-import { Codex } from '@openai/codex-sdk';
+import { Codex } from "@openai/codex-sdk";
 
 // Track active sessions
 const activeCodexSessions = new Map();
@@ -26,9 +26,9 @@ const activeCodexSessions = new Map();
 function transformCodexEvent(event) {
   // Map SDK event types to a consistent format
   switch (event.type) {
-    case 'item.started':
-    case 'item.updated':
-    case 'item.completed':
+    case "item.started":
+    case "item.updated":
+    case "item.completed":
       const item = event.item;
       if (!item) {
         return { type: event.type, item: null };
@@ -36,122 +36,122 @@ function transformCodexEvent(event) {
 
       // Transform based on item type
       switch (item.type) {
-        case 'agent_message':
+        case "agent_message":
           return {
-            type: 'item',
-            itemType: 'agent_message',
+            type: "item",
+            itemType: "agent_message",
             message: {
-              role: 'assistant',
-              content: item.text
-            }
-          };
-
-        case 'reasoning':
-          return {
-            type: 'item',
-            itemType: 'reasoning',
-            message: {
-              role: 'assistant',
+              role: "assistant",
               content: item.text,
-              isReasoning: true
-            }
+            },
           };
 
-        case 'command_execution':
+        case "reasoning":
           return {
-            type: 'item',
-            itemType: 'command_execution',
+            type: "item",
+            itemType: "reasoning",
+            message: {
+              role: "assistant",
+              content: item.text,
+              isReasoning: true,
+            },
+          };
+
+        case "command_execution":
+          return {
+            type: "item",
+            itemType: "command_execution",
             command: item.command,
             output: item.aggregated_output,
             exitCode: item.exit_code,
-            status: item.status
+            status: item.status,
           };
 
-        case 'file_change':
+        case "file_change":
           return {
-            type: 'item',
-            itemType: 'file_change',
+            type: "item",
+            itemType: "file_change",
             changes: item.changes,
-            status: item.status
+            status: item.status,
           };
 
-        case 'mcp_tool_call':
+        case "mcp_tool_call":
           return {
-            type: 'item',
-            itemType: 'mcp_tool_call',
+            type: "item",
+            itemType: "mcp_tool_call",
             server: item.server,
             tool: item.tool,
             arguments: item.arguments,
             result: item.result,
             error: item.error,
-            status: item.status
+            status: item.status,
           };
 
-        case 'web_search':
+        case "web_search":
           return {
-            type: 'item',
-            itemType: 'web_search',
-            query: item.query
+            type: "item",
+            itemType: "web_search",
+            query: item.query,
           };
 
-        case 'todo_list':
+        case "todo_list":
           return {
-            type: 'item',
-            itemType: 'todo_list',
-            items: item.items
+            type: "item",
+            itemType: "todo_list",
+            items: item.items,
           };
 
-        case 'error':
+        case "error":
           return {
-            type: 'item',
-            itemType: 'error',
+            type: "item",
+            itemType: "error",
             message: {
-              role: 'error',
-              content: item.message
-            }
+              role: "error",
+              content: item.message,
+            },
           };
 
         default:
           return {
-            type: 'item',
+            type: "item",
             itemType: item.type,
-            item: item
+            item: item,
           };
       }
 
-    case 'turn.started':
+    case "turn.started":
       return {
-        type: 'turn_started'
+        type: "turn_started",
       };
 
-    case 'turn.completed':
+    case "turn.completed":
       return {
-        type: 'turn_complete',
-        usage: event.usage
+        type: "turn_complete",
+        usage: event.usage,
       };
 
-    case 'turn.failed':
+    case "turn.failed":
       return {
-        type: 'turn_failed',
-        error: event.error
+        type: "turn_failed",
+        error: event.error,
       };
 
-    case 'thread.started':
+    case "thread.started":
       return {
-        type: 'thread_started',
-        threadId: event.id
+        type: "thread_started",
+        threadId: event.id,
       };
 
-    case 'error':
+    case "error":
       return {
-        type: 'error',
-        message: event.message
+        type: "error",
+        message: event.message,
       };
 
     default:
       return {
         type: event.type,
-        data: event
+        data: event,
       };
   }
 }
@@ -163,21 +163,21 @@ function transformCodexEvent(event) {
  */
 function mapPermissionModeToCodexOptions(permissionMode) {
   switch (permissionMode) {
-    case 'acceptEdits':
+    case "acceptEdits":
       return {
-        sandboxMode: 'workspace-write',
-        approvalPolicy: 'never'
+        sandboxMode: "workspace-write",
+        approvalPolicy: "never",
       };
-    case 'bypassPermissions':
+    case "bypassPermissions":
       return {
-        sandboxMode: 'danger-full-access',
-        approvalPolicy: 'never'
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
       };
-    case 'default':
+    case "default":
     default:
       return {
-        sandboxMode: 'workspace-write',
-        approvalPolicy: 'untrusted'
+        sandboxMode: "workspace-write",
+        approvalPolicy: "untrusted",
       };
   }
 }
@@ -194,11 +194,12 @@ export async function queryCodex(command, options = {}, ws) {
     cwd,
     projectPath,
     model,
-    permissionMode = 'default'
+    permissionMode = "default",
   } = options;
 
   const workingDirectory = cwd || projectPath || process.cwd();
-  const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
+  const { sandboxMode, approvalPolicy } =
+    mapPermissionModeToCodexOptions(permissionMode);
 
   let codex;
   let thread;
@@ -214,7 +215,7 @@ export async function queryCodex(command, options = {}, ws) {
       skipGitRepoCheck: true,
       sandboxMode,
       approvalPolicy,
-      model
+      model,
     };
 
     // Start or resume thread
@@ -231,15 +232,15 @@ export async function queryCodex(command, options = {}, ws) {
     activeCodexSessions.set(currentSessionId, {
       thread,
       codex,
-      status: 'running',
-      startedAt: new Date().toISOString()
+      status: "running",
+      startedAt: new Date().toISOString(),
     });
 
     // Send session created event
     sendMessage(ws, {
-      type: 'session-created',
+      type: "session-created",
       sessionId: currentSessionId,
-      provider: 'codex'
+      provider: "codex",
     });
 
     // Execute with streaming
@@ -248,57 +249,56 @@ export async function queryCodex(command, options = {}, ws) {
     for await (const event of streamedTurn.events) {
       // Check if session was aborted
       const session = activeCodexSessions.get(currentSessionId);
-      if (!session || session.status === 'aborted') {
+      if (!session || session.status === "aborted") {
         break;
       }
 
-      if (event.type === 'item.started' || event.type === 'item.updated') {
+      if (event.type === "item.started" || event.type === "item.updated") {
         continue;
       }
 
       const transformed = transformCodexEvent(event);
 
       sendMessage(ws, {
-        type: 'codex-response',
+        type: "codex-response",
         data: transformed,
-        sessionId: currentSessionId
+        sessionId: currentSessionId,
       });
 
       // Extract and send token usage if available (normalized to match Claude format)
-      if (event.type === 'turn.completed' && event.usage) {
-        const totalTokens = (event.usage.input_tokens || 0) + (event.usage.output_tokens || 0);
+      if (event.type === "turn.completed" && event.usage) {
+        const totalTokens =
+          (event.usage.input_tokens || 0) + (event.usage.output_tokens || 0);
         sendMessage(ws, {
-          type: 'token-budget',
+          type: "token-budget",
           data: {
             used: totalTokens,
-            total: 200000 // Default context window for Codex models
-          }
+            total: 200000, // Default context window for Codex models
+          },
         });
       }
     }
 
     // Send completion event
     sendMessage(ws, {
-      type: 'codex-complete',
+      type: "codex-complete",
       sessionId: currentSessionId,
-      actualSessionId: thread.id
+      actualSessionId: thread.id,
     });
-
   } catch (error) {
-    console.error('[Codex] Error:', error);
+    console.error("[Codex] Error:", error);
 
     sendMessage(ws, {
-      type: 'codex-error',
+      type: "codex-error",
       error: error.message,
-      sessionId: currentSessionId
+      sessionId: currentSessionId,
     });
-
   } finally {
     // Update session status
     if (currentSessionId) {
       const session = activeCodexSessions.get(currentSessionId);
       if (session) {
-        session.status = 'completed';
+        session.status = "completed";
       }
     }
   }
@@ -316,7 +316,7 @@ export function abortCodexSession(sessionId) {
     return false;
   }
 
-  session.status = 'aborted';
+  session.status = "aborted";
 
   // The SDK doesn't have a direct abort method, but marking status
   // will cause the streaming loop to exit
@@ -331,7 +331,7 @@ export function abortCodexSession(sessionId) {
  */
 export function isCodexSessionActive(sessionId) {
   const session = activeCodexSessions.get(sessionId);
-  return session?.status === 'running';
+  return session?.status === "running";
 }
 
 /**
@@ -342,11 +342,11 @@ export function getActiveCodexSessions() {
   const sessions = [];
 
   for (const [id, session] of activeCodexSessions.entries()) {
-    if (session.status === 'running') {
+    if (session.status === "running") {
       sessions.push({
         id,
         status: session.status,
-        startedAt: session.startedAt
+        startedAt: session.startedAt,
       });
     }
   }
@@ -364,26 +364,34 @@ function sendMessage(ws, data) {
     if (ws.isSSEStreamWriter || ws.isWebSocketWriter) {
       // Writer handles stringification (SSEStreamWriter or WebSocketWriter)
       ws.send(data);
-    } else if (typeof ws.send === 'function') {
+    } else if (typeof ws.send === "function") {
       // Raw WebSocket - stringify here
       ws.send(JSON.stringify(data));
     }
   } catch (error) {
-    console.error('[Codex] Error sending message:', error);
+    console.error("[Codex] Error sending message:", error);
   }
 }
 
-// Clean up old completed sessions periodically
-setInterval(() => {
+/**
+ * Clean up old completed sessions
+ * Note: This is called by maintenance-scheduler.js
+ * @returns {number} - Number of sessions cleaned up
+ */
+export function cleanupCodexSessions() {
   const now = Date.now();
   const maxAge = 30 * 60 * 1000; // 30 minutes
+  let cleaned = 0;
 
   for (const [id, session] of activeCodexSessions.entries()) {
-    if (session.status !== 'running') {
+    if (session.status !== "running") {
       const startedAt = new Date(session.startedAt).getTime();
       if (now - startedAt > maxAge) {
         activeCodexSessions.delete(id);
+        cleaned++;
       }
     }
   }
-}, 5 * 60 * 1000); // Every 5 minutes
+
+  return cleaned;
+}

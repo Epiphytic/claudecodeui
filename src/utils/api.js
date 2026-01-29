@@ -25,6 +25,9 @@ export const authenticatedFetch = (url, options = {}) => {
 
 // API endpoints
 export const api = {
+  // Environment info (public, no token required)
+  environment: () => fetch("/api/environment"),
+
   // Auth endpoints (no token required)
   auth: {
     status: () => fetch("/api/auth/status"),
@@ -47,6 +50,16 @@ export const api = {
   // Protected endpoints
   // config endpoint removed - no longer needed (frontend uses window.location)
   projects: () => authenticatedFetch("/api/projects"),
+
+  // External session detection - checks for Claude CLI running outside this app
+  // Response is cacheable for 60 seconds
+  externalSessions: (projectPath = null) => {
+    const url = projectPath
+      ? `/api/external-sessions?projectPath=${encodeURIComponent(projectPath)}`
+      : "/api/external-sessions";
+    return authenticatedFetch(url);
+  },
+
   sessionsList: (timeframe = "1w", etag = null, signal = null) => {
     const headers = {};
     if (etag) {
@@ -119,6 +132,51 @@ export const api = {
     }
     return authenticatedFetch(url, options);
   },
+
+  // NEW: Efficient message list endpoint (IDs and numbers only)
+  messagesList: (projectName, sessionId, etag = null, signal = null) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/list`;
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
+  // NEW: Get single message by number (1-indexed)
+  messageByNumber: (
+    projectName,
+    sessionId,
+    messageNumber,
+    etag = null,
+    signal = null,
+  ) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/number/${messageNumber}`;
+    const headers = {};
+    if (etag) {
+      headers["If-None-Match"] = etag;
+    }
+    const options = { headers };
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
+  // NEW: Get messages by range
+  messagesByRange: (projectName, sessionId, start, end, signal = null) => {
+    const url = `/api/projects/${encodeURIComponent(projectName)}/sessions/${encodeURIComponent(sessionId)}/messages/range/${start}/${end}`;
+    const options = {};
+    if (signal) {
+      options.signal = signal;
+    }
+    return authenticatedFetch(url, options);
+  },
+
   renameProject: (projectName, displayName) =>
     authenticatedFetch(
       `/api/projects/${encodeURIComponent(projectName)}/rename`,

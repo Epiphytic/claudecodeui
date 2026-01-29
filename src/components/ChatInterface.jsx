@@ -25,6 +25,7 @@ import React, {
   useLayoutEffect,
   memo,
 } from "react";
+import { useAuth } from "../contexts/AuthContext";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -58,6 +59,11 @@ import SessionStatusIndicator from "./SessionStatusIndicator";
 
 import { safeJsonParse } from "../lib/utils.js";
 
+// Generate unique IDs for messages to ensure stable React keys
+// Using a counter + timestamp for uniqueness without crypto dependency
+let messageIdCounter = 0;
+const generateMessageId = () => `msg-${Date.now()}-${++messageIdCounter}`;
+
 // Helper function to decode HTML entities in text
 function decodeHtmlEntities(text) {
   if (!text) return text;
@@ -67,6 +73,14 @@ function decodeHtmlEntities(text) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, "&");
+}
+
+// Format polling interval for display (e.g., "5s", "30s", "2m", "20m")
+function formatPollInterval(ms) {
+  if (ms < 60000) {
+    return `${Math.round(ms / 1000)}s`;
+  }
+  return `${Math.round(ms / 60000)}m`;
 }
 
 // Parse task notification XML content
@@ -619,6 +633,7 @@ const MessageComponent = memo(
     showThinking,
     selectedProject,
     provider,
+    user,
   }) => {
     const isGrouped =
       prevMessage &&
@@ -704,9 +719,17 @@ const MessageComponent = memo(
               </div>
             </div>
             {!isGrouped && (
-              <div className="hidden sm:flex w-8 h-8 bg-blue-600 rounded-full items-center justify-center text-white text-sm flex-shrink-0">
-                U
-              </div>
+              user?.avatarUrl ? (
+                <img
+                  src={user.avatarUrl}
+                  alt={user.username || "User"}
+                  className="hidden sm:block w-8 h-8 rounded-full flex-shrink-0 object-cover"
+                />
+              ) : (
+                <div className="hidden sm:flex w-8 h-8 bg-blue-600 rounded-full items-center justify-center text-white text-sm flex-shrink-0">
+                  U
+                </div>
+              )
             )}
           </div>
         ) : (
@@ -721,6 +744,12 @@ const MessageComponent = memo(
                 ) : message.type === "tool" ? (
                   <div className="w-8 h-8 bg-gray-600 dark:bg-gray-700 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0">
                     🔧
+                  </div>
+                ) : message.type === "system" ? (
+                  <div className="w-8 h-8 bg-gray-500 dark:bg-gray-600 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
                   </div>
                 ) : (
                   <div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0 p-1">
@@ -740,13 +769,15 @@ const MessageComponent = memo(
                     ? "Error"
                     : message.type === "tool"
                       ? "Tool"
-                      : (localStorage.getItem("selected-provider") ||
-                            "claude") === "cursor"
-                        ? "Cursor"
+                      : message.type === "system"
+                        ? "System"
                         : (localStorage.getItem("selected-provider") ||
-                              "claude") === "codex"
-                          ? "Codex"
-                          : "Claude"}
+                              "claude") === "cursor"
+                          ? "Cursor"
+                          : (localStorage.getItem("selected-provider") ||
+                                "claude") === "codex"
+                            ? "Codex"
+                            : "Claude"}
                 </div>
               </div>
             )}
@@ -2757,6 +2788,7 @@ function ChatInterface({
   onTaskClick,
   onShowAllTasks,
 }) {
+  const { user } = useAuth();
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
   const [input, setInput] = useState(() => {
     if (typeof window !== "undefined" && selectedProject) {
@@ -2807,6 +2839,33 @@ function ChatInterface({
   const isLoadingMoreRef = useRef(false);
   const topLoadLockRef = useRef(false);
   const pendingScrollRestoreRef = useRef(null);
+  // Efficient message caching
+  const messageListCacheRef = useRef(null); // { messages: [], total: number, etag: string }
+  const messageBodiesCacheRef = useRef(new Map()); // Map<number, message>
+  const lastKnownMessageNumberRef = useRef(0);
+  const oldestLoadedMessageRef = useRef(0); // Track oldest loaded message for lazy loading
+  const messageListLastFetchedRef = useRef(0); // Timestamp of last list fetch
+  const messagePollingRef = useRef(null); // Polling timer reference
+  const listPollingRef = useRef(null); // List backup polling timer
+
+  // Exponential backoff for message polling
+  const MESSAGE_POLL_INITIAL = 5000; // 5 seconds initial
+  const MESSAGE_POLL_MAX = 20 * 60 * 1000; // 20 minutes max
+  const LIST_POLL_INITIAL = 60 * 1000; // 1 minute initial
+  const LIST_POLL_MAX = 60 * 60 * 1000; // 1 hour max
+  const BACKOFF_MULTIPLIER = 1.5;
+  const MESSAGE_LIST_BACKUP_INTERVAL = 5 * 60 * 1000; // 5 minutes backup interval
+  const INITIAL_MESSAGE_COUNT = 100; // Only load last 100 messages initially
+
+  const [messagePollInterval, setMessagePollInterval] =
+    useState(MESSAGE_POLL_INITIAL);
+  const [listPollInterval, setListPollInterval] = useState(LIST_POLL_INITIAL);
+  const messagePollIntervalRef = useRef(MESSAGE_POLL_INITIAL);
+  const listPollIntervalRef = useRef(LIST_POLL_INITIAL);
+
+  // Polling coordination - prevent simultaneous requests
+  const isMessagePollingRef = useRef(false);
+  const isListPollingRef = useRef(false);
   // Streaming throttle buffers
   const streamBufferRef = useRef("");
   const streamTimerRef = useRef(null);
@@ -2836,8 +2895,6 @@ function ChatInterface({
   const [externalSessionWarning, setExternalSessionWarning] = useState(null);
   const [sessionState, setSessionState] = useState(null);
   const [isRefreshingMessages, setIsRefreshingMessages] = useState(false);
-  const messagesEtagRef = useRef(null);
-  const autoRefreshIntervalRef = useRef(null);
   const statusTimeoutRef = useRef(null);
   const STATUS_TIMEOUT_MS = 60000; // 60 seconds without status update = reset loading
   const [provider, setProvider] = useState(() => {
@@ -3084,6 +3141,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: data.content,
               timestamp: Date.now(),
@@ -3096,6 +3154,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: `**Current Model**: ${data.current.model}\n\n**Available Models**:\n\nClaude: ${data.available.claude.join(", ")}\n\nCursor: ${data.available.cursor.join(", ")}`,
               timestamp: Date.now(),
@@ -3107,7 +3166,7 @@ function ChatInterface({
           const costMessage = `**Token Usage**: ${data.tokenUsage.used.toLocaleString()} / ${data.tokenUsage.total.toLocaleString()} (${data.tokenUsage.percentage}%)\n\n**Estimated Cost**:\n- Input: $${data.cost.input}\n- Output: $${data.cost.output}\n- **Total**: $${data.cost.total}\n\n**Model**: ${data.model}`;
           setChatMessages((prev) => [
             ...prev,
-            { role: "assistant", content: costMessage, timestamp: Date.now() },
+            { id: generateMessageId(), role: "assistant", content: costMessage, timestamp: Date.now() },
           ]);
           break;
         }
@@ -3117,6 +3176,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               role: "assistant",
               content: statusMessage,
               timestamp: Date.now(),
@@ -3130,6 +3190,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⚠️ ${data.message}`,
                 timestamp: Date.now(),
@@ -3139,6 +3200,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `📝 ${data.message}\n\nPath: \`${data.path}\``,
                 timestamp: Date.now(),
@@ -3164,6 +3226,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⚠️ ${data.message}`,
                 timestamp: Date.now(),
@@ -3175,6 +3238,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 role: "assistant",
                 content: `⏪ ${data.message}`,
                 timestamp: Date.now(),
@@ -3206,6 +3270,7 @@ function ChatInterface({
         setChatMessages((prev) => [
           ...prev,
           {
+            id: generateMessageId(),
             role: "assistant",
             content: "❌ Command execution cancelled",
             timestamp: Date.now(),
@@ -3289,6 +3354,7 @@ function ChatInterface({
         setChatMessages((prev) => [
           ...prev,
           {
+            id: generateMessageId(),
             role: "assistant",
             content: `Error executing command: ${error.message}`,
             timestamp: Date.now(),
@@ -3327,7 +3393,7 @@ function ChatInterface({
     };
   }, []);
 
-  // Load session messages from API with pagination
+  // Load session messages from API using efficient caching strategy
   const loadSessionMessages = useCallback(
     async (projectName, sessionId, loadMore = false, provider = "claude") => {
       if (!projectName || !sessionId) return [];
@@ -3340,37 +3406,171 @@ function ChatInterface({
       }
 
       try {
-        const currentOffset = loadMore ? messagesOffset : 0;
-        const response = await api.sessionMessages(
-          projectName,
-          sessionId,
-          MESSAGES_PER_PAGE,
-          currentOffset,
-          provider,
-        );
-        if (!response.ok) {
-          throw new Error("Failed to load session messages");
-        }
-        const data = await response.json();
+        // For non-Claude providers, use the old endpoint
+        if (provider !== "claude") {
+          const currentOffset = loadMore ? messagesOffset : 0;
+          const response = await api.sessionMessages(
+            projectName,
+            sessionId,
+            MESSAGES_PER_PAGE,
+            currentOffset,
+            provider,
+          );
+          if (!response.ok) {
+            throw new Error("Failed to load session messages");
+          }
+          const data = await response.json();
 
-        // Extract token usage if present (Codex includes it in messages response)
-        if (isInitialLoad && data.tokenUsage) {
-          setTokenBudget(data.tokenUsage);
+          if (isInitialLoad && data.tokenUsage) {
+            setTokenBudget(data.tokenUsage);
+          }
+
+          if (data.hasMore !== undefined) {
+            setHasMoreMessages(data.hasMore);
+            setTotalMessages(data.total);
+            setMessagesOffset(currentOffset + (data.messages?.length || 0));
+            return data.messages || [];
+          } else {
+            const messages = data.messages || [];
+            setHasMoreMessages(false);
+            setTotalMessages(messages.length);
+            return messages;
+          }
         }
 
-        // Handle paginated response
-        if (data.hasMore !== undefined) {
-          setHasMoreMessages(data.hasMore);
-          setTotalMessages(data.total);
-          setMessagesOffset(currentOffset + (data.messages?.length || 0));
-          return data.messages || [];
-        } else {
-          // Backward compatibility for non-paginated response
-          const messages = data.messages || [];
-          setHasMoreMessages(false);
-          setTotalMessages(messages.length);
+        // For Claude, use efficient caching strategy
+        // Messages are immutable - only fetch list as backup every 5 minutes
+        const now = Date.now();
+        const timeSinceLastListFetch = now - messageListLastFetchedRef.current;
+        const hasValidCache =
+          messageListCacheRef.current &&
+          lastKnownMessageNumberRef.current > 0 &&
+          messageBodiesCacheRef.current.size > 0;
+
+        // Skip list fetch if we have valid cache and it's within the backup interval
+        // Initial load (isInitialLoad=true) should always fetch
+        if (
+          hasValidCache &&
+          !isInitialLoad &&
+          timeSinceLastListFetch < MESSAGE_LIST_BACKUP_INTERVAL
+        ) {
+          // Return cached messages without hitting the server
+          const cached = messageBodiesCacheRef.current;
+          const messages = [];
+          for (let i = 1; i <= lastKnownMessageNumberRef.current; i++) {
+            if (cached.has(i)) {
+              messages.push(cached.get(i));
+            }
+          }
           return messages;
         }
+
+        // Step 1: Get the message list (only on initial load or every 5 minutes as backup)
+        const listResponse = await api.messagesList(
+          projectName,
+          sessionId,
+          messageListCacheRef.current?.etag,
+        );
+
+        if (listResponse.status === 304) {
+          // List hasn't changed, return cached messages
+          messageListLastFetchedRef.current = now;
+          const cached = messageBodiesCacheRef.current;
+          const messages = [];
+          for (let i = 1; i <= lastKnownMessageNumberRef.current; i++) {
+            if (cached.has(i)) {
+              messages.push(cached.get(i));
+            }
+          }
+          return messages;
+        }
+
+        if (!listResponse.ok) {
+          throw new Error("Failed to load message list");
+        }
+
+        const listData = await listResponse.json();
+        const etag = listResponse.headers.get("etag");
+
+        // Update cache and timestamp
+        messageListCacheRef.current = {
+          messages: listData.messages,
+          total: listData.total,
+          etag,
+        };
+        messageListLastFetchedRef.current = now;
+
+        setTotalMessages(listData.total);
+
+        // Step 2: Determine which messages to fetch
+        const allMessageNumbers = listData.messages.map((m) => m.number);
+        const cachedBodies = messageBodiesCacheRef.current;
+
+        // On initial load, only fetch the last INITIAL_MESSAGE_COUNT messages
+        // On loadMore (handled by loadOlderMessages), this function won't be called
+        let messageNumbersToLoad;
+        if (isInitialLoad && allMessageNumbers.length > INITIAL_MESSAGE_COUNT) {
+          // Only load the last 100 messages
+          messageNumbersToLoad = allMessageNumbers.slice(
+            -INITIAL_MESSAGE_COUNT,
+          );
+          setHasMoreMessages(true);
+          // Track the oldest message we're loading
+          oldestLoadedMessageRef.current = Math.min(...messageNumbersToLoad);
+        } else {
+          // Load all messages (small session or loadMore request)
+          messageNumbersToLoad = allMessageNumbers;
+          setHasMoreMessages(false);
+          if (allMessageNumbers.length > 0) {
+            oldestLoadedMessageRef.current = Math.min(...allMessageNumbers);
+          }
+        }
+
+        const missingNumbers = messageNumbersToLoad.filter(
+          (n) => !cachedBodies.has(n),
+        );
+
+        // Step 3: Fetch missing messages (use range for efficiency)
+        if (missingNumbers.length > 0) {
+          const minMissing = Math.min(...missingNumbers);
+          const maxMissing = Math.max(...missingNumbers);
+
+          // Batch fetch in chunks of 100
+          for (let start = minMissing; start <= maxMissing; start += 100) {
+            const end = Math.min(start + 99, maxMissing);
+            const rangeResponse = await api.messagesByRange(
+              projectName,
+              sessionId,
+              start,
+              end,
+            );
+
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                cachedBodies.set(msg.number, msg);
+              }
+            }
+          }
+        }
+
+        // Update last known message number
+        if (allMessageNumbers.length > 0) {
+          lastKnownMessageNumberRef.current = Math.max(...allMessageNumbers);
+        }
+
+        // Build ordered message array from cache (only loaded messages)
+        const messages = [];
+        for (const m of listData.messages) {
+          if (
+            cachedBodies.has(m.number) &&
+            messageNumbersToLoad.includes(m.number)
+          ) {
+            messages.push(cachedBodies.get(m.number));
+          }
+        }
+
+        return messages;
       } catch (error) {
         console.error("Error loading session messages:", error);
         return [];
@@ -3383,6 +3583,131 @@ function ChatInterface({
       }
     },
     [messagesOffset],
+  );
+
+  // Reset polling intervals to initial values
+  // The next scheduled poll will use the new (reset) interval from the ref
+  const resetPollingIntervals = useCallback(() => {
+    messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+    listPollIntervalRef.current = LIST_POLL_INITIAL;
+    setMessagePollInterval(MESSAGE_POLL_INITIAL);
+    setListPollInterval(LIST_POLL_INITIAL);
+  }, []);
+
+  // Increase message poll interval with exponential backoff
+  const increaseMessagePollInterval = useCallback(() => {
+    const newInterval = Math.min(
+      messagePollIntervalRef.current * BACKOFF_MULTIPLIER,
+      MESSAGE_POLL_MAX,
+    );
+    messagePollIntervalRef.current = newInterval;
+    setMessagePollInterval(newInterval);
+  }, []);
+
+  // Increase list poll interval with exponential backoff
+  const increaseListPollInterval = useCallback(() => {
+    const newInterval = Math.min(
+      listPollIntervalRef.current * BACKOFF_MULTIPLIER,
+      LIST_POLL_MAX,
+    );
+    listPollIntervalRef.current = newInterval;
+    setListPollInterval(newInterval);
+  }, []);
+
+  // Poll for new messages when chat is active
+  // Messages are immutable - just append new ones without re-fetching the list
+  // Returns true if new messages were found
+  const pollForNewMessages = useCallback(
+    async (projectName, sessionId) => {
+      if (!projectName || !sessionId) return false;
+
+      // Prevent simultaneous polls - skip if any polling is in progress
+      if (isMessagePollingRef.current || isListPollingRef.current) {
+        return false;
+      }
+      isMessagePollingRef.current = true;
+
+      const nextNumber = lastKnownMessageNumberRef.current + 1;
+
+      try {
+        // First, check if there's a new message by fetching the next one
+        const response = await api.messageByNumber(
+          projectName,
+          sessionId,
+          nextNumber,
+        );
+
+        if (response.ok) {
+          // New message found! Now fetch the list to know total count
+          const listResponse = await api.messagesList(projectName, sessionId);
+          if (!listResponse.ok) {
+            // Fallback: just use this single message
+            const data = await response.json();
+            messageBodiesCacheRef.current.set(data.number, data.message);
+            lastKnownMessageNumberRef.current = nextNumber;
+            setSessionMessages((prev) => [...prev, data.message]);
+            setTotalMessages((prev) => prev + 1);
+            resetPollingIntervals();
+            isMessagePollingRef.current = false;
+            return true;
+          }
+
+          const listData = await listResponse.json();
+          const totalCount = listData.total;
+
+          // Fetch new messages in chunks of 100 (API limit)
+          const newMessages = [];
+          for (let start = nextNumber; start <= totalCount; start += 100) {
+            const end = Math.min(start + 99, totalCount);
+            const rangeResponse = await api.messagesByRange(
+              projectName,
+              sessionId,
+              start,
+              end,
+            );
+
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                messageBodiesCacheRef.current.set(msg.number, msg);
+                newMessages.push(msg);
+              }
+            }
+          }
+
+          // Fallback if no messages were fetched via range
+          if (newMessages.length === 0) {
+            // Use the single message we already fetched
+            const data = await response.json();
+            messageBodiesCacheRef.current.set(data.number, data.message);
+            newMessages.push(data.message);
+          }
+
+          // Update last known number
+          lastKnownMessageNumberRef.current = totalCount;
+
+          // Append new messages directly to state
+          if (newMessages.length > 0) {
+            setSessionMessages((prev) => [...prev, ...newMessages]);
+            setTotalMessages(totalCount);
+            resetPollingIntervals();
+            isMessagePollingRef.current = false;
+            return true;
+          }
+        }
+        // If 404, no new messages - increase backoff
+        increaseMessagePollInterval();
+        isMessagePollingRef.current = false;
+        return false;
+      } catch (error) {
+        console.error("Error polling for new messages:", error);
+        isMessagePollingRef.current = false;
+        // On error, also increase backoff
+        increaseMessagePollInterval();
+        return false;
+      }
+    },
+    [resetPollingIntervals, increaseMessagePollInterval],
   );
 
   // Load Cursor session messages from SQLite via backend
@@ -3761,6 +4086,13 @@ function ChatInterface({
   const convertSessionMessages = (rawMessages) => {
     const converted = [];
     const toolResults = new Map(); // Map tool_use_id to tool result
+    let messageIndex = 0; // Counter for generating stable IDs
+
+    // Helper to generate stable ID based on timestamp and position
+    const generateStableId = (timestamp) => {
+      const ts = new Date(timestamp || Date.now()).getTime();
+      return `loaded-${ts}-${messageIndex++}`;
+    };
 
     // First pass: collect all tool results
     for (const msg of rawMessages) {
@@ -3850,7 +4182,9 @@ function ChatInterface({
             displayContent = unescapeWithMathProtection(displayContent);
           }
           converted.push({
-            type: messageType,
+            id: generateStableId(msg.timestamp),
+            // Task notifications should appear as system messages, not user messages
+            type: taskNotification ? "system" : messageType,
             content: taskNotification
               ? taskNotification.summary
               : displayContent,
@@ -3865,6 +4199,7 @@ function ChatInterface({
       // Handle thinking messages (Codex reasoning)
       else if (msg.type === "thinking" && msg.message?.content) {
         converted.push({
+          id: generateStableId(msg.timestamp),
           type: "assistant",
           content: unescapeWithMathProtection(msg.message.content),
           timestamp: msg.timestamp || new Date().toISOString(),
@@ -3875,6 +4210,7 @@ function ChatInterface({
       // Handle tool_use messages (Codex function calls)
       else if (msg.type === "tool_use" && msg.toolName) {
         converted.push({
+          id: generateStableId(msg.timestamp),
           type: "assistant",
           content: "",
           timestamp: msg.timestamp || new Date().toISOString(),
@@ -3912,6 +4248,7 @@ function ChatInterface({
                 text = unescapeWithMathProtection(text);
               }
               converted.push({
+                id: generateStableId(msg.timestamp),
                 type: "assistant",
                 content: text,
                 timestamp: msg.timestamp || new Date().toISOString(),
@@ -3921,6 +4258,7 @@ function ChatInterface({
               const toolResult = toolResults.get(part.id);
 
               converted.push({
+                id: generateStableId(msg.timestamp),
                 type: "assistant",
                 content: "",
                 timestamp: msg.timestamp || new Date().toISOString(),
@@ -3947,6 +4285,7 @@ function ChatInterface({
           let text = msg.message.content;
           text = unescapeWithMathProtection(text);
           converted.push({
+            id: generateStableId(msg.timestamp),
             type: "assistant",
             content: text,
             timestamp: msg.timestamp || new Date().toISOString(),
@@ -3996,10 +4335,68 @@ function ChatInterface({
       if (sessionProvider === "cursor") return false;
 
       isLoadingMoreRef.current = true;
+      setIsLoadingMoreMessages(true);
       const previousScrollHeight = container.scrollHeight;
       const previousScrollTop = container.scrollTop;
 
       try {
+        // For Claude, use range endpoint directly for efficiency
+        if (sessionProvider === "claude") {
+          const currentOldest = oldestLoadedMessageRef.current;
+          if (currentOldest <= 1) {
+            // No more messages to load
+            setHasMoreMessages(false);
+            return false;
+          }
+
+          // Calculate range: load INITIAL_MESSAGE_COUNT messages before the current oldest
+          const endNum = currentOldest - 1;
+          const startNum = Math.max(1, endNum - INITIAL_MESSAGE_COUNT + 1);
+
+          const rangeResponse = await api.messagesByRange(
+            selectedProject.name,
+            selectedSession.id,
+            startNum,
+            endNum,
+          );
+
+          if (!rangeResponse.ok) {
+            console.error("Failed to load older messages");
+            return false;
+          }
+
+          const rangeData = await rangeResponse.json();
+          const olderMessages = rangeData.messages || [];
+
+          if (olderMessages.length > 0) {
+            // Cache the fetched messages
+            const cachedBodies = messageBodiesCacheRef.current;
+            for (const msg of olderMessages) {
+              cachedBodies.set(msg.number, msg);
+            }
+
+            // Update oldest loaded message
+            const newOldest = Math.min(...olderMessages.map((m) => m.number));
+            oldestLoadedMessageRef.current = newOldest;
+
+            // Check if there are more messages to load
+            setHasMoreMessages(newOldest > 1);
+
+            // Sort messages by number and prepend
+            olderMessages.sort((a, b) => a.number - b.number);
+            pendingScrollRestoreRef.current = {
+              height: previousScrollHeight,
+              top: previousScrollTop,
+            };
+            setSessionMessages((prev) => [...olderMessages, ...prev]);
+          } else {
+            setHasMoreMessages(false);
+          }
+
+          return true;
+        }
+
+        // For other providers, use the old pagination approach
         const moreMessages = await loadSessionMessages(
           selectedProject.name,
           selectedSession.id,
@@ -4018,6 +4415,7 @@ function ChatInterface({
         return true;
       } finally {
         isLoadingMoreRef.current = false;
+        setIsLoadingMoreMessages(false);
       }
     },
     [
@@ -4080,6 +4478,28 @@ function ChatInterface({
           setMessagesOffset(0);
           setHasMoreMessages(false);
           setTotalMessages(0);
+          // Reset message caches for efficient loading
+          messageListCacheRef.current = null;
+          messageBodiesCacheRef.current = new Map();
+          lastKnownMessageNumberRef.current = 0;
+          oldestLoadedMessageRef.current = 0;
+          messageListLastFetchedRef.current = 0;
+          // Reset polling intervals and locks
+          messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+          listPollIntervalRef.current = LIST_POLL_INITIAL;
+          setMessagePollInterval(MESSAGE_POLL_INITIAL);
+          setListPollInterval(LIST_POLL_INITIAL);
+          isMessagePollingRef.current = false;
+          isListPollingRef.current = false;
+          // Clear polling timers
+          if (messagePollingRef.current) {
+            clearTimeout(messagePollingRef.current);
+            messagePollingRef.current = null;
+          }
+          if (listPollingRef.current) {
+            clearTimeout(listPollingRef.current);
+            listPollingRef.current = null;
+          }
           // Reset token budget when switching sessions
           // It will update when user sends a message and receives new budget from WebSocket
           setTokenBudget(null);
@@ -4100,6 +4520,19 @@ function ChatInterface({
           setMessagesOffset(0);
           setHasMoreMessages(false);
           setTotalMessages(0);
+          // Reset message caches for efficient loading
+          messageListCacheRef.current = null;
+          messageBodiesCacheRef.current = new Map();
+          lastKnownMessageNumberRef.current = 0;
+          oldestLoadedMessageRef.current = 0;
+          messageListLastFetchedRef.current = 0;
+          // Reset polling intervals and locks
+          messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+          listPollIntervalRef.current = LIST_POLL_INITIAL;
+          setMessagePollInterval(MESSAGE_POLL_INITIAL);
+          setListPollInterval(LIST_POLL_INITIAL);
+          isMessagePollingRef.current = false;
+          isListPollingRef.current = false;
 
           // Check if the session is currently processing on the backend
           if (ws && sendMessage) {
@@ -4176,6 +4609,28 @@ function ChatInterface({
         setMessagesOffset(0);
         setHasMoreMessages(false);
         setTotalMessages(0);
+        // Clear message caches
+        messageListCacheRef.current = null;
+        messageBodiesCacheRef.current = new Map();
+        lastKnownMessageNumberRef.current = 0;
+        oldestLoadedMessageRef.current = 0;
+        messageListLastFetchedRef.current = 0;
+        // Reset polling intervals and locks
+        messagePollIntervalRef.current = MESSAGE_POLL_INITIAL;
+        listPollIntervalRef.current = LIST_POLL_INITIAL;
+        setMessagePollInterval(MESSAGE_POLL_INITIAL);
+        setListPollInterval(LIST_POLL_INITIAL);
+        isMessagePollingRef.current = false;
+        isListPollingRef.current = false;
+        // Clear polling timers
+        if (messagePollingRef.current) {
+          clearTimeout(messagePollingRef.current);
+          messagePollingRef.current = null;
+        }
+        if (listPollingRef.current) {
+          clearTimeout(listPollingRef.current);
+          listPollingRef.current = null;
+        }
       }
 
       // Mark loading as complete after messages are set
@@ -4194,18 +4649,19 @@ function ChatInterface({
     isSystemSessionChange,
   ]);
 
-  // External Message Update Handler: Reload messages when external CLI modifies current session
+  // External Message Update Handler: Incrementally load new messages when external CLI modifies current session
   // This triggers when App.jsx detects a JSONL file change for the currently-viewed session
-  // Only reloads if the session is NOT active (respecting Session Protection System)
+  // Only updates if the session is NOT active (respecting Session Protection System)
+  // Uses incremental loading to avoid full page reloads
   useEffect(() => {
     if (externalMessageUpdate > 0 && selectedSession && selectedProject) {
-      const reloadExternalMessages = async () => {
+      const loadNewExternalMessages = async () => {
         try {
           const provider =
             localStorage.getItem("selected-provider") || "claude";
 
           if (provider === "cursor") {
-            // Reload Cursor messages from SQLite
+            // Cursor: Full reload (SQLite-based, already efficient)
             const projectPath =
               selectedProject.fullPath || selectedProject.path;
             const converted = await loadCursorSessionMessages(
@@ -4215,45 +4671,280 @@ function ChatInterface({
             setSessionMessages([]);
             setChatMessages(converted);
           } else {
-            // Reload Claude/Codex messages from API/JSONL
-            const messages = await loadSessionMessages(
+            // Claude/Codex: Incremental load only NEW messages
+            // Get the current message list to check for new messages
+            const listResponse = await api.messagesList(
               selectedProject.name,
               selectedSession.id,
-              false,
-              selectedSession.__provider || "claude",
+              messageListCacheRef.current?.etag,
             );
-            setSessionMessages(messages);
-            // convertedMessages will be automatically updated via useMemo
 
-            // Smart scroll behavior: only auto-scroll if user is near bottom
-            const shouldAutoScroll = autoScrollToBottom && isNearBottom();
-            if (shouldAutoScroll) {
-              setTimeout(() => scrollToBottom(), 200);
+            if (listResponse.status === 304) {
+              // No changes - nothing to do
+              return;
             }
-            // If user scrolled up, preserve their position (they're reading history)
+
+            if (!listResponse.ok) {
+              console.error(
+                "Failed to fetch message list for incremental update",
+              );
+              return;
+            }
+
+            const listData = await listResponse.json();
+            const etag = listResponse.headers.get("etag");
+            const currentCount = lastKnownMessageNumberRef.current;
+
+            // Only fetch if there are new messages
+            if (listData.total > currentCount) {
+              // Find the first missing message number
+              let startNum = currentCount + 1;
+              while (
+                startNum <= listData.total &&
+                messageBodiesCacheRef.current.has(startNum)
+              ) {
+                startNum++;
+              }
+
+              // Fetch new messages in chunks of 100 (API limit)
+              if (startNum <= listData.total) {
+                for (let chunkStart = startNum; chunkStart <= listData.total; chunkStart += 100) {
+                  const chunkEnd = Math.min(chunkStart + 99, listData.total);
+                  const rangeResponse = await api.messagesByRange(
+                    selectedProject.name,
+                    selectedSession.id,
+                    chunkStart,
+                    chunkEnd,
+                  );
+                  if (rangeResponse.ok) {
+                    const rangeData = await rangeResponse.json();
+                    for (const msg of rangeData.messages) {
+                      messageBodiesCacheRef.current.set(msg.number, msg);
+                    }
+                  }
+                }
+              }
+
+              lastKnownMessageNumberRef.current = listData.total;
+
+              // Append only new messages (preserves existing messages in state)
+              const newMessages = [];
+              for (let i = currentCount + 1; i <= listData.total; i++) {
+                if (messageBodiesCacheRef.current.has(i)) {
+                  newMessages.push(messageBodiesCacheRef.current.get(i));
+                }
+              }
+
+              if (newMessages.length > 0) {
+                setSessionMessages((prev) => [...prev, ...newMessages]);
+                setTotalMessages(listData.total);
+
+                // Smart scroll: only auto-scroll if user is near bottom
+                const shouldAutoScroll = autoScrollToBottom && isNearBottom();
+                if (shouldAutoScroll) {
+                  setTimeout(() => scrollToBottom(), 200);
+                }
+              }
+
+              // Update cache
+              messageListCacheRef.current = {
+                messages: listData.messages,
+                total: listData.total,
+                etag,
+              };
+              messageListLastFetchedRef.current = Date.now();
+            }
           }
         } catch (error) {
           console.error(
-            "Error reloading messages from external update:",
+            "Error loading new messages from external update:",
             error,
           );
         }
       };
 
-      reloadExternalMessages();
+      loadNewExternalMessages();
     }
   }, [
     externalMessageUpdate,
     selectedSession,
     selectedProject,
     loadCursorSessionMessages,
-    loadSessionMessages,
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
   ]);
 
-  // Manual refresh function with ETag caching support
+  // Polling for new messages when chat is active (Claude provider only)
+  // Uses exponential backoff - starts at 5s, increases to 20min max
+  useEffect(() => {
+    const provider = localStorage.getItem("selected-provider") || "claude";
+
+    // Only poll for Claude sessions when chat window is up and not actively loading
+    if (
+      selectedSession &&
+      selectedProject &&
+      provider === "claude" &&
+      !isLoading &&
+      !isLoadingSessionMessages
+    ) {
+      // Use setTimeout with dynamic interval for exponential backoff
+      const scheduleNextPoll = () => {
+        messagePollingRef.current = setTimeout(async () => {
+          await pollForNewMessages(selectedProject.name, selectedSession.id);
+          // Schedule next poll with current interval (may have changed)
+          scheduleNextPoll();
+        }, messagePollIntervalRef.current);
+      };
+
+      scheduleNextPoll();
+
+      return () => {
+        if (messagePollingRef.current) {
+          clearTimeout(messagePollingRef.current);
+          messagePollingRef.current = null;
+        }
+      };
+    }
+  }, [
+    selectedSession,
+    selectedProject,
+    isLoading,
+    isLoadingSessionMessages,
+    pollForNewMessages,
+  ]);
+
+  // Backup list polling with exponential backoff (starts at 1min, up to 1hr)
+  useEffect(() => {
+    const provider = localStorage.getItem("selected-provider") || "claude";
+
+    if (
+      selectedSession &&
+      selectedProject &&
+      provider === "claude" &&
+      !isLoading &&
+      !isLoadingSessionMessages
+    ) {
+      const scheduleListPoll = () => {
+        listPollingRef.current = setTimeout(async () => {
+          // Skip if message polling is in progress or list polling already running
+          if (isMessagePollingRef.current || isListPollingRef.current) {
+            scheduleListPoll();
+            return;
+          }
+
+          isListPollingRef.current = true;
+
+          // Fetch the messages list as backup
+          try {
+            const listResponse = await api.messagesList(
+              selectedProject.name,
+              selectedSession.id,
+              messageListCacheRef.current?.etag,
+            );
+
+            if (listResponse.ok) {
+              const listData = await listResponse.json();
+              const etag = listResponse.headers.get("etag");
+
+              // Check if we have new messages
+              const currentCount = lastKnownMessageNumberRef.current;
+              if (listData.total > currentCount) {
+                // Find the first missing message number (skip those already in cache)
+                let startNum = currentCount + 1;
+                while (
+                  startNum <= listData.total &&
+                  messageBodiesCacheRef.current.has(startNum)
+                ) {
+                  startNum++;
+                }
+
+                // Fetch all missing messages in chunks of 100 (API limit)
+                if (startNum <= listData.total) {
+                  for (let chunkStart = startNum; chunkStart <= listData.total; chunkStart += 100) {
+                    const chunkEnd = Math.min(chunkStart + 99, listData.total);
+                    const rangeResponse = await api.messagesByRange(
+                      selectedProject.name,
+                      selectedSession.id,
+                      chunkStart,
+                      chunkEnd,
+                    );
+                    if (rangeResponse.ok) {
+                      const rangeData = await rangeResponse.json();
+                      for (const msg of rangeData.messages) {
+                        messageBodiesCacheRef.current.set(msg.number, msg);
+                      }
+                    }
+                  }
+                }
+                lastKnownMessageNumberRef.current = listData.total;
+
+                // Append new messages instead of rebuilding entire array
+                // This preserves lazy loading - only add new messages
+                const newMessages = [];
+                for (let i = currentCount + 1; i <= listData.total; i++) {
+                  if (messageBodiesCacheRef.current.has(i)) {
+                    newMessages.push(messageBodiesCacheRef.current.get(i));
+                  }
+                }
+                if (newMessages.length > 0) {
+                  setSessionMessages((prev) => [...prev, ...newMessages]);
+                }
+                setTotalMessages(listData.total);
+
+                // Reset intervals on new messages
+                isListPollingRef.current = false;
+                resetPollingIntervals();
+              } else {
+                // No new messages, increase backoff
+                increaseListPollInterval();
+              }
+
+              // Update cache
+              messageListCacheRef.current = {
+                messages: listData.messages,
+                total: listData.total,
+                etag,
+              };
+              messageListLastFetchedRef.current = Date.now();
+            } else if (listResponse.status === 304) {
+              // No changes, increase backoff
+              increaseListPollInterval();
+            } else {
+              // Error (not 304), increase backoff
+              increaseListPollInterval();
+            }
+          } catch (error) {
+            console.error("Error in list backup poll:", error);
+            increaseListPollInterval();
+          }
+
+          isListPollingRef.current = false;
+
+          // Schedule next poll
+          scheduleListPoll();
+        }, listPollIntervalRef.current);
+      };
+
+      scheduleListPoll();
+
+      return () => {
+        if (listPollingRef.current) {
+          clearTimeout(listPollingRef.current);
+          listPollingRef.current = null;
+        }
+      };
+    }
+  }, [
+    selectedSession,
+    selectedProject,
+    isLoading,
+    isLoadingSessionMessages,
+    resetPollingIntervals,
+    increaseListPollInterval,
+  ]);
+
+  // Manual refresh function - fetches messages/list and resets polling intervals
   const refreshMessages = useCallback(async () => {
     if (!selectedSession || !selectedProject || isLoading) return;
 
@@ -4266,46 +4957,63 @@ function ChatInterface({
     setIsRefreshingMessages(true);
 
     try {
-      const response = await api.sessionMessages(
+      // Reset polling intervals on manual refresh
+      resetPollingIntervals();
+
+      // Fetch the messages list directly
+      const listResponse = await api.messagesList(
         selectedProject.name,
         selectedSession.id,
-        null, // Get all messages for refresh
-        0,
-        currentProvider,
-        messagesEtagRef.current,
-        null,
+        null, // Don't use etag - force fresh fetch
       );
 
-      // Handle 304 Not Modified - no changes
-      if (response.status === 304) {
-        setIsRefreshingMessages(false);
-        return;
-      }
+      if (listResponse.ok) {
+        const listData = await listResponse.json();
+        const etag = listResponse.headers.get("etag");
 
-      if (!response.ok) {
-        throw new Error(`Failed to refresh messages: ${response.status}`);
-      }
-
-      // Store new ETag
-      const newETag = response.headers.get("etag");
-      if (newETag) {
-        messagesEtagRef.current = newETag;
-      }
-
-      const data = await response.json();
-      const newMessages = data.messages || [];
-
-      // Only update if we got new messages
-      if (newMessages.length > 0) {
-        setSessionMessages(newMessages);
-        setTotalMessages(newMessages.length);
-        setHasMoreMessages(false);
-        setMessagesOffset(newMessages.length);
-
-        // Scroll to bottom if user was already near bottom
-        if (isNearBottom && autoScrollToBottom) {
-          setTimeout(() => scrollToBottom(), 100);
+        // Fetch any missing messages using range endpoint (in chunks of 100)
+        const currentCount = lastKnownMessageNumberRef.current;
+        if (listData.total > currentCount) {
+          for (let chunkStart = currentCount + 1; chunkStart <= listData.total; chunkStart += 100) {
+            const chunkEnd = Math.min(chunkStart + 99, listData.total);
+            const rangeResponse = await api.messagesByRange(
+              selectedProject.name,
+              selectedSession.id,
+              chunkStart,
+              chunkEnd,
+            );
+            if (rangeResponse.ok) {
+              const rangeData = await rangeResponse.json();
+              for (const msg of rangeData.messages) {
+                messageBodiesCacheRef.current.set(msg.number, msg);
+              }
+            }
+          }
+          lastKnownMessageNumberRef.current = listData.total;
         }
+
+        // Rebuild messages array
+        const messages = [];
+        for (let i = 1; i <= listData.total; i++) {
+          if (messageBodiesCacheRef.current.has(i)) {
+            messages.push(messageBodiesCacheRef.current.get(i));
+          }
+        }
+        setSessionMessages(messages);
+        setTotalMessages(listData.total);
+
+        // Update cache
+        messageListCacheRef.current = {
+          messages: listData.messages,
+          total: listData.total,
+          etag,
+        };
+        messageListLastFetchedRef.current = Date.now();
+      }
+
+      // Scroll to bottom if user was already near bottom
+      if (isNearBottom && autoScrollToBottom) {
+        setTimeout(() => scrollToBottom(), 100);
       }
     } catch (error) {
       if (error.name !== "AbortError") {
@@ -4321,50 +5029,13 @@ function ChatInterface({
     isNearBottom,
     autoScrollToBottom,
     scrollToBottom,
+    resetPollingIntervals,
   ]);
 
-  // Auto-refresh every 10 seconds when external session is detected
-  useEffect(() => {
-    // Clear any existing interval
-    if (autoRefreshIntervalRef.current) {
-      clearInterval(autoRefreshIntervalRef.current);
-      autoRefreshIntervalRef.current = null;
-    }
-
-    // Only auto-refresh if external session warning is present and not currently loading
-    if (
-      externalSessionWarning &&
-      selectedSession &&
-      selectedProject &&
-      !isLoading
-    ) {
-      console.log(
-        "[ChatInterface] External session detected, starting auto-refresh",
-      );
-
-      autoRefreshIntervalRef.current = setInterval(() => {
-        refreshMessages();
-      }, 10000); // 10 seconds
-    }
-
-    return () => {
-      if (autoRefreshIntervalRef.current) {
-        clearInterval(autoRefreshIntervalRef.current);
-        autoRefreshIntervalRef.current = null;
-      }
-    };
-  }, [
-    externalSessionWarning,
-    selectedSession,
-    selectedProject,
-    isLoading,
-    refreshMessages,
-  ]);
-
-  // Reset ETag when session changes
-  useEffect(() => {
-    messagesEtagRef.current = null;
-  }, [selectedSession?.id]);
+  // Note: Auto-refresh uses exponential backoff polling
+  // Message poll: starts at 5s, backs off to 20min max
+  // List poll: starts at 1min, backs off to 1hr max
+  // Intervals reset when new messages found or manual refresh
 
   // Update chatMessages when convertedMessages changes
   useEffect(() => {
@@ -4606,6 +5277,7 @@ function ChatInterface({
                       last.content = (last.content || "") + chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -4639,6 +5311,7 @@ function ChatInterface({
                     last.content = (last.content || "") + chunk;
                   } else {
                     updated.push({
+                      id: generateMessageId(),
                       type: "assistant",
                       content: chunk,
                       timestamp: new Date(),
@@ -4740,6 +5413,7 @@ function ChatInterface({
                 setChatMessages((prev) => [
                   ...prev,
                   {
+                    id: generateMessageId(),
                     type: "assistant",
                     content: "",
                     timestamp: new Date(),
@@ -4759,6 +5433,7 @@ function ChatInterface({
                 setChatMessages((prev) => [
                   ...prev,
                   {
+                    id: generateMessageId(),
                     type: "assistant",
                     content: content,
                     timestamp: new Date(),
@@ -4778,6 +5453,7 @@ function ChatInterface({
             setChatMessages((prev) => [
               ...prev,
               {
+                id: generateMessageId(),
                 type: "assistant",
                 content: content,
                 timestamp: new Date(),
@@ -4840,6 +5516,7 @@ function ChatInterface({
                         : chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -4858,6 +5535,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: latestMessage.data,
               timestamp: new Date(),
@@ -4921,6 +5599,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Error: ${latestMessage.error}`,
               timestamp: new Date(),
@@ -4978,6 +5657,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: `Using tool: ${latestMessage.tool} ${latestMessage.input ? `with ${latestMessage.input}` : ""}`,
               timestamp: new Date(),
@@ -4993,6 +5673,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Cursor error: ${latestMessage.error || "Unknown error"}`,
               timestamp: new Date(),
@@ -5054,6 +5735,7 @@ function ChatInterface({
                   last.isStreaming = false;
                 } else if (textResult && textResult.trim()) {
                   updated.push({
+                    id: generateMessageId(),
                     type: r.is_error ? "error" : "assistant",
                     content: textResult,
                     timestamp: new Date(),
@@ -5117,6 +5799,7 @@ function ChatInterface({
                         : chunk;
                     } else {
                       updated.push({
+                        id: generateMessageId(),
                         type: "assistant",
                         content: chunk,
                         timestamp: new Date(),
@@ -5205,6 +5888,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: content,
                         timestamp: new Date(),
@@ -5221,6 +5905,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: content,
                         timestamp: new Date(),
@@ -5235,6 +5920,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: "",
                         timestamp: new Date(),
@@ -5256,6 +5942,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "assistant",
                         content: "",
                         timestamp: new Date(),
@@ -5272,6 +5959,7 @@ function ChatInterface({
                   setChatMessages((prev) => [
                     ...prev,
                     {
+                      id: generateMessageId(),
                       type: "assistant",
                       content: "",
                       timestamp: new Date(),
@@ -5290,6 +5978,7 @@ function ChatInterface({
                     setChatMessages((prev) => [
                       ...prev,
                       {
+                        id: generateMessageId(),
                         type: "error",
                         content: codexData.message.content,
                         timestamp: new Date(),
@@ -5319,6 +6008,7 @@ function ChatInterface({
               setChatMessages((prev) => [
                 ...prev,
                 {
+                  id: generateMessageId(),
                   type: "error",
                   content: codexData.error?.message || "Turn failed",
                   timestamp: new Date(),
@@ -5389,6 +6079,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: latestMessage.error || "An error occurred with Codex",
               timestamp: new Date(),
@@ -5424,6 +6115,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "assistant",
               content: "Session interrupted by user.",
               timestamp: new Date(),
@@ -5500,6 +6192,7 @@ function ChatInterface({
               setChatMessages((prev) => [
                 ...prev,
                 {
+                  id: generateMessageId(),
                   type: "error",
                   content:
                     "Connection timeout: No response from the server. The session may have ended unexpectedly.",
@@ -5902,6 +6595,7 @@ function ChatInterface({
           setChatMessages((prev) => [
             ...prev,
             {
+              id: generateMessageId(),
               type: "error",
               content: `Failed to upload images: ${error.message}`,
               timestamp: new Date(),
@@ -5912,6 +6606,7 @@ function ChatInterface({
       }
 
       const userMessage = {
+        id: generateMessageId(),
         type: "user",
         content: input,
         images: uploadedImages,
@@ -6066,6 +6761,207 @@ function ChatInterface({
       setClaudeStatus,
       setIsUserScrolledUp,
       scrollToBottom,
+    ],
+  );
+
+  // Handle forking to a new session - similar to handleSubmit but always starts fresh
+  const handleFork = useCallback(
+    async (e) => {
+      e.preventDefault();
+      if (!input.trim() || isLoading || !selectedProject) return;
+
+      // Apply thinking mode prefix if selected
+      let messageContent = input;
+      const selectedThinkingMode = thinkingModes.find(
+        (mode) => mode.id === thinkingMode,
+      );
+      if (selectedThinkingMode && selectedThinkingMode.prefix) {
+        messageContent = `${selectedThinkingMode.prefix}: ${input}`;
+      }
+
+      // Upload images first if any
+      let uploadedImages = [];
+      if (attachedImages.length > 0) {
+        const formData = new FormData();
+        attachedImages.forEach((file) => {
+          formData.append("images", file);
+        });
+
+        try {
+          const response = await authenticatedFetch(
+            `/api/projects/${encodeURIComponent(selectedProject.name)}/upload-images`,
+            {
+              method: "POST",
+              headers: {},
+              body: formData,
+            },
+          );
+
+          if (!response.ok) {
+            throw new Error("Failed to upload images");
+          }
+
+          const result = await response.json();
+          uploadedImages = result.images;
+        } catch (error) {
+          console.error("Image upload failed:", error);
+          setChatMessages((prev) => [
+            ...prev,
+            {
+              id: generateMessageId(),
+              type: "error",
+              content: `Failed to upload images: ${error.message}`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+      }
+
+      const userMessage = {
+        id: generateMessageId(),
+        type: "user",
+        content: input,
+        images: uploadedImages,
+        timestamp: new Date(),
+      };
+
+      // Clear existing messages since we're starting a new session
+      setChatMessages([userMessage]);
+      setIsLoading(true);
+      setCanAbortSession(true);
+      setClaudeStatus({
+        text: "Starting new session",
+        tokens: 0,
+        can_interrupt: true,
+      });
+
+      // Clear current session ID since we're forking
+      setCurrentSessionId(null);
+      setIsUserScrolledUp(false);
+      setTimeout(() => scrollToBottom(), 100);
+
+      // Create a temporary session placeholder for protection
+      const tempSessionId = `forked-session-${Date.now()}`;
+      if (onSessionActive) {
+        onSessionActive(tempSessionId);
+      }
+
+      // Get tools settings
+      const getToolsSettings = () => {
+        try {
+          const settingsKey =
+            provider === "cursor"
+              ? "cursor-tools-settings"
+              : provider === "codex"
+                ? "codex-settings"
+                : "claude-settings";
+          const savedSettings = safeLocalStorage.getItem(settingsKey);
+          if (savedSettings) {
+            return JSON.parse(savedSettings);
+          }
+        } catch (error) {
+          console.error("Error loading tools settings:", error);
+        }
+        return {
+          allowedTools: [],
+          disallowedTools: [],
+          skipPermissions: false,
+        };
+      };
+
+      const toolsSettings = getToolsSettings();
+
+      // Send command WITHOUT session ID to start fresh
+      if (provider === "cursor") {
+        sendMessage({
+          type: "cursor-command",
+          command: input,
+          sessionId: null, // No session - start fresh
+          options: {
+            cwd: selectedProject.fullPath || selectedProject.path,
+            projectPath: selectedProject.fullPath || selectedProject.path,
+            sessionId: null,
+            resume: false, // Don't resume - start new
+            model: cursorModel,
+            skipPermissions: toolsSettings?.skipPermissions || false,
+            toolsSettings: toolsSettings,
+          },
+        });
+      } else if (provider === "codex") {
+        sendMessage({
+          type: "codex-command",
+          command: input,
+          sessionId: null,
+          options: {
+            cwd: selectedProject.fullPath || selectedProject.path,
+            projectPath: selectedProject.fullPath || selectedProject.path,
+            sessionId: null,
+            resume: false,
+            model: codexModel,
+            permissionMode:
+              permissionMode === "plan" ? "default" : permissionMode,
+          },
+        });
+      } else {
+        // Claude - send without session ID
+        sendMessage({
+          type: "claude-command",
+          command: input,
+          options: {
+            projectPath: selectedProject.path,
+            cwd: selectedProject.fullPath,
+            sessionId: null, // No session - start fresh
+            resume: false, // Don't resume
+            toolsSettings: toolsSettings,
+            permissionMode: permissionMode,
+            model: claudeModel,
+            images: uploadedImages,
+          },
+        });
+      }
+
+      setInput("");
+      setAttachedImages([]);
+      setUploadingImages(new Map());
+      setImageErrors(new Map());
+      setIsTextareaExpanded(false);
+      setThinkingMode("none");
+
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "auto";
+      }
+
+      if (selectedProject) {
+        safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
+      }
+    },
+    [
+      input,
+      isLoading,
+      selectedProject,
+      attachedImages,
+      provider,
+      permissionMode,
+      onSessionActive,
+      cursorModel,
+      claudeModel,
+      codexModel,
+      sendMessage,
+      setInput,
+      setAttachedImages,
+      setUploadingImages,
+      setImageErrors,
+      setIsTextareaExpanded,
+      textareaRef,
+      setChatMessages,
+      setIsLoading,
+      setCanAbortSession,
+      setClaudeStatus,
+      setIsUserScrolledUp,
+      scrollToBottom,
+      setCurrentSessionId,
+      thinkingMode,
     ],
   );
 
@@ -6492,48 +7388,6 @@ function ChatInterface({
         `}
       </style>
       <div className="h-full flex flex-col">
-        {/* External Session Warning Banner */}
-        {externalSessionWarning && (
-          <div className="flex-shrink-0 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-200 dark:border-orange-800 px-4 py-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-orange-700 dark:text-orange-400 text-sm">
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                  />
-                </svg>
-                <span>External Claude session detected on this project</span>
-              </div>
-              <button
-                onClick={() => setExternalSessionWarning(null)}
-                className="text-orange-500 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300"
-              >
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
-                </svg>
-              </button>
-            </div>
-          </div>
-        )}
-
         {/* Messages Area - Scrollable Middle Section */}
         <div
           ref={scrollContainerRef}
@@ -6541,7 +7395,8 @@ function ChatInterface({
           onTouchMove={handleScroll}
           className="flex-1 overflow-y-auto overflow-x-hidden px-0 py-3 sm:p-4 space-y-3 sm:space-y-4 relative"
         >
-          {isLoadingSessionMessages && chatMessages.length === 0 ? (
+          {chatMessages.length === 0 && (isLoadingSessionMessages || selectedSession || currentSessionId) ? (
+            // Show loading spinner when a session is selected but messages haven't loaded yet
             <div className="text-center text-gray-500 dark:text-gray-400 mt-8">
               <div className="flex items-center justify-center space-x-2">
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-400"></div>
@@ -6847,7 +7702,7 @@ function ChatInterface({
 
                 return (
                   <MessageComponent
-                    key={index}
+                    key={message.id || message.blobId || `legacy-${index}`}
                     message={message}
                     index={index}
                     prevMessage={prevMessage}
@@ -6860,6 +7715,7 @@ function ChatInterface({
                     showThinking={showThinking}
                     selectedProject={selectedProject}
                     provider={provider}
+                    user={user}
                   />
                 );
               })}
@@ -7113,42 +7969,53 @@ function ChatInterface({
                 />
               )}
 
-              {/* Refresh messages button */}
-              <button
-                type="button"
-                onClick={refreshMessages}
-                disabled={isRefreshingMessages || isLoading || !selectedSession}
-                className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800 ${
-                  isRefreshingMessages
-                    ? "text-blue-500 dark:text-blue-400"
-                    : externalSessionWarning
-                      ? "text-orange-500 hover:text-orange-600 dark:text-orange-400 dark:hover:text-orange-300"
-                      : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
-                } ${!selectedSession ? "opacity-50 cursor-not-allowed" : ""}`}
-                title={
-                  externalSessionWarning
-                    ? "Refresh messages (auto-refreshing every 10s due to external session)"
-                    : "Refresh messages"
-                }
-              >
-                <svg
-                  className={`w-4 h-4 ${isRefreshingMessages ? "animate-spin" : ""}`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
+              {/* Refresh messages button with polling interval indicator */}
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={refreshMessages}
+                  disabled={
+                    isRefreshingMessages || isLoading || !selectedSession
+                  }
+                  className={`relative w-8 h-8 rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800 ${
+                    isRefreshingMessages
+                      ? "text-blue-500 dark:text-blue-400"
+                      : externalSessionWarning
+                        ? "text-orange-500 hover:text-orange-600 dark:text-orange-400 dark:hover:text-orange-300"
+                        : "text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                  } ${!selectedSession ? "opacity-50 cursor-not-allowed" : ""}`}
+                  title={`Refresh messages (next poll: ${formatPollInterval(messagePollInterval)})`}
                 >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                  />
-                </svg>
-                {/* Auto-refresh indicator dot */}
-                {externalSessionWarning && !isRefreshingMessages && (
-                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
-                )}
-              </button>
+                  <svg
+                    className={`w-4 h-4 ${isRefreshingMessages ? "animate-spin" : ""}`}
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                    />
+                  </svg>
+                  {/* Auto-refresh indicator dot */}
+                  {externalSessionWarning && !isRefreshingMessages && (
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-orange-500 rounded-full animate-pulse" />
+                  )}
+                </button>
+                {/* Polling interval indicator */}
+                {selectedSession &&
+                  (localStorage.getItem("selected-provider") || "claude") ===
+                    "claude" && (
+                    <span
+                      className="text-xs text-gray-400 dark:text-gray-500 tabular-nums"
+                      title={`Next message poll in ${formatPollInterval(messagePollInterval)}`}
+                    >
+                      {formatPollInterval(messagePollInterval)}
+                    </span>
+                  )}
+              </div>
 
               {/* Token usage pie chart - positioned next to mode indicator */}
               <TokenUsagePie
@@ -7262,6 +8129,48 @@ function ChatInterface({
               )}
             </div>
           </div>
+
+          {/* External Session Warning - Above Chat Input */}
+          {externalSessionWarning && (
+            <div className="max-w-4xl mx-auto mb-2 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg px-4 py-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-orange-700 dark:text-orange-400 text-sm">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                    />
+                  </svg>
+                  <span>External Claude session detected — use Fork to start a new session</span>
+                </div>
+                <button
+                  onClick={() => setExternalSessionWarning(null)}
+                  className="text-orange-500 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300"
+                >
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M6 18L18 6M6 6l12 12"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          )}
 
           <form onSubmit={handleSubmit} className="relative max-w-4xl mx-auto">
             {/* Drag overlay */}
@@ -7434,18 +8343,54 @@ function ChatInterface({
                 />
               </div>
 
-              {/* Send button */}
+              {/* Fork button - starts a new session (Git-style fork icon) */}
               <button
-                type="submit"
+                type="button"
                 disabled={!input.trim() || isLoading}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  handleSubmit(e);
+                  handleFork(e);
                 }}
                 onTouchStart={(e) => {
                   e.preventDefault();
-                  handleSubmit(e);
+                  handleFork(e);
                 }}
+                title="Fork: Start new session with this prompt"
+                className="absolute right-16 top-1/2 transform -translate-y-1/2 w-10 h-10 sm:w-10 sm:h-10 bg-[#F05032] hover:bg-[#D84528] disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-[#F05032] focus:ring-offset-2 dark:ring-offset-gray-800"
+              >
+                {/* Git-style fork/branch icon */}
+                <svg
+                  className="w-5 h-5 sm:w-5 sm:h-5 text-white"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                >
+                  {/* Git branch icon - two branches merging */}
+                  <circle cx="7" cy="5" r="2.5" />
+                  <circle cx="17" cy="5" r="2.5" />
+                  <circle cx="12" cy="19" r="2.5" />
+                  <path
+                    d="M7 7.5V11c0 1.5 1 3 5 5.5M17 7.5V11c0 1.5-1 3-5 5.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+
+              {/* Send button - disabled when external session detected */}
+              <button
+                type="submit"
+                disabled={!input.trim() || isLoading || !!externalSessionWarning}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  if (!externalSessionWarning) handleSubmit(e);
+                }}
+                onTouchStart={(e) => {
+                  e.preventDefault();
+                  if (!externalSessionWarning) handleSubmit(e);
+                }}
+                title={externalSessionWarning ? "External session detected — use Fork instead" : "Send message"}
                 className="absolute right-2 top-1/2 transform -translate-y-1/2 w-12 h-12 sm:w-12 sm:h-12 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800"
               >
                 <svg

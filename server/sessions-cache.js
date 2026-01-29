@@ -212,8 +212,24 @@ function getLastProjectsData() {
   return lastProjectsData;
 }
 
+/**
+ * Update a specific session's summary/title
+ * Used when chat is updated to reflect the latest user prompt
+ */
+function updateSessionTitle(sessionId, newTitle) {
+  const session = cachedSessions.find((s) => s.id === sessionId);
+  if (session && newTitle) {
+    session.summary = newTitle;
+    cacheVersion++;
+    cacheTimestamp = new Date().toISOString();
+    return true;
+  }
+  return false;
+}
+
 export {
   updateSessionsCache,
+  updateSessionTitle,
   getSessionsByTimeframe,
   generateETag,
   getCacheMeta,

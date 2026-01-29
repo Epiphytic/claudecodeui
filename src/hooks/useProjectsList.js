@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { api } from "../utils/api";
 
-const POLL_INTERVAL = 60000; // 60 seconds (was 10 seconds)
+// Exponential backoff constants
+const POLL_INITIAL = 60000; // 1 minute initial
+const POLL_MAX = 60 * 60 * 1000; // 1 hour max
+const BACKOFF_MULTIPLIER = 1.5;
 
 /**
  * Hook for fetching slim projects list with ETag-based caching
@@ -9,13 +12,14 @@ const POLL_INTERVAL = 60000; // 60 seconds (was 10 seconds)
  *
  * Features:
  * - Non-blocking background refresh (doesn't show loading spinner on polls)
- * - 60-second default polling interval
+ * - Exponential backoff: starts at 1 min, backs off to 1 hour max
+ * - Resets to 1 min when changes detected or manual refresh
  * - Manual refresh via refresh() function
  * - ETag-based caching for efficiency
  *
  * @param {string} timeframe - Time filter: '1h' | '8h' | '1d' | '1w' | '2w' | '1m' | 'all'
  * @param {boolean} enabled - Whether to enable fetching and polling
- * @returns {Object} { projects, meta, isLoading, isRefreshing, error, refresh }
+ * @returns {Object} { projects, meta, isLoading, isRefreshing, error, refresh, pollInterval }
  */
 function useProjectsList(timeframe = "1w", enabled = true) {
   const [projects, setProjects] = useState([]);
@@ -23,12 +27,30 @@ function useProjectsList(timeframe = "1w", enabled = true) {
   const [isLoading, setIsLoading] = useState(true); // Only true for initial load
   const [isRefreshing, setIsRefreshing] = useState(false); // True during background refresh
   const [error, setError] = useState(null);
+  const [pollInterval, setPollInterval] = useState(POLL_INITIAL);
 
   // Store ETag for 304 support
   const etagRef = useRef(null);
-  const pollIntervalRef = useRef(null);
+  const pollTimeoutRef = useRef(null);
+  const pollIntervalRef = useRef(POLL_INITIAL);
   const hasInitialLoadRef = useRef(false);
   const abortControllerRef = useRef(null);
+
+  // Reset poll interval to initial value
+  const resetPollInterval = useCallback(() => {
+    pollIntervalRef.current = POLL_INITIAL;
+    setPollInterval(POLL_INITIAL);
+  }, []);
+
+  // Increase poll interval with exponential backoff
+  const increasePollInterval = useCallback(() => {
+    const newInterval = Math.min(
+      pollIntervalRef.current * BACKOFF_MULTIPLIER,
+      POLL_MAX,
+    );
+    pollIntervalRef.current = newInterval;
+    setPollInterval(newInterval);
+  }, []);
 
   const fetchProjects = useCallback(
     async (isManualRefresh = false) => {
@@ -57,11 +79,13 @@ function useProjectsList(timeframe = "1w", enabled = true) {
           abortControllerRef.current.signal,
         );
 
-        // Handle 304 Not Modified - data unchanged, no need to update state
+        // Handle 304 Not Modified - data unchanged, increase backoff
         if (response.status === 304) {
           setIsLoading(false);
           setIsRefreshing(false);
           hasInitialLoadRef.current = true;
+          // No changes - increase backoff interval
+          increasePollInterval();
           return;
         }
 
@@ -88,6 +112,8 @@ function useProjectsList(timeframe = "1w", enabled = true) {
         setMeta(data.meta || null);
         setError(null);
         hasInitialLoadRef.current = true;
+        // Changes detected - reset to initial interval
+        resetPollInterval();
       } catch (err) {
         // Ignore abort errors
         if (err.name === "AbortError") {
@@ -98,12 +124,14 @@ function useProjectsList(timeframe = "1w", enabled = true) {
         if (!hasInitialLoadRef.current) {
           setError(err.message);
         }
+        // On error, increase backoff
+        increasePollInterval();
       } finally {
         setIsLoading(false);
         setIsRefreshing(false);
       }
     },
-    [timeframe, enabled],
+    [timeframe, enabled, resetPollInterval, increasePollInterval],
   );
 
   // Initial fetch and timeframe change
@@ -123,34 +151,35 @@ function useProjectsList(timeframe = "1w", enabled = true) {
     };
   }, [timeframe, enabled, fetchProjects]);
 
-  // Set up polling - runs silently in background
+  // Set up polling with exponential backoff - runs silently in background
   useEffect(() => {
     if (!enabled) return;
 
-    // Clear any existing interval
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-    }
+    // Use setTimeout with dynamic interval for exponential backoff
+    const scheduleNextPoll = () => {
+      pollTimeoutRef.current = setTimeout(async () => {
+        await fetchProjects(false);
+        // Schedule next poll with current interval (may have changed)
+        scheduleNextPoll();
+      }, pollIntervalRef.current);
+    };
 
-    // Start polling (silent background refresh)
-    pollIntervalRef.current = setInterval(
-      () => fetchProjects(false),
-      POLL_INTERVAL,
-    );
+    scheduleNextPoll();
 
     return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
+      if (pollTimeoutRef.current) {
+        clearTimeout(pollTimeoutRef.current);
+        pollTimeoutRef.current = null;
       }
     };
   }, [enabled, fetchProjects]);
 
-  // Force refresh function (clears ETag to force new data)
+  // Force refresh function (clears ETag to force new data, resets interval)
   const refresh = useCallback(() => {
     etagRef.current = null;
+    resetPollInterval();
     fetchProjects(true);
-  }, [fetchProjects]);
+  }, [fetchProjects, resetPollInterval]);
 
   return {
     projects,
@@ -159,6 +188,7 @@ function useProjectsList(timeframe = "1w", enabled = true) {
     isRefreshing,
     error,
     refresh,
+    pollInterval,
   };
 }
 

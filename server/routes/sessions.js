@@ -5,19 +5,28 @@
  * GET /api/sessions/list
  * Returns a flat list of all sessions with optional timeframe filtering.
  * Supports ETag/304 caching for efficient polling.
+ *
+ * Now reads directly from SQLite for better performance and memory efficiency.
  */
 
 import express from "express";
-import {
-  getSessionsByTimeframe,
-  generateETag,
-  getCacheMeta,
-  isCacheInitialized,
-  waitForInitialization,
-  TIMEFRAME_MS,
-} from "../sessions-cache.js";
+import crypto from "crypto";
+import { getSessions, getSessionCount } from "../database.js";
 
 const router = express.Router();
+
+/**
+ * Timeframe definitions in milliseconds
+ */
+const TIMEFRAME_MS = {
+  "1h": 60 * 60 * 1000,
+  "8h": 8 * 60 * 60 * 1000,
+  "1d": 24 * 60 * 60 * 1000,
+  "1w": 7 * 24 * 60 * 60 * 1000,
+  "2w": 14 * 24 * 60 * 60 * 1000,
+  "1m": 30 * 24 * 60 * 60 * 1000,
+  all: Infinity,
+};
 
 /**
  * GET /api/sessions/list
@@ -34,26 +43,30 @@ const router = express.Router();
  */
 router.get("/list", async (req, res) => {
   try {
-    // Wait for cache to be initialized (blocks until ready or timeout)
-    if (!isCacheInitialized()) {
-      try {
-        await waitForInitialization();
-      } catch (err) {
-        return res.status(503).json({
-          error: "Sessions cache initialization timeout",
-          message: err.message,
-        });
-      }
-    }
-
     // Get timeframe from query (validate against known values)
     const timeframe =
       TIMEFRAME_MS[req.query.timeframe] !== undefined
         ? req.query.timeframe
         : "1w";
 
-    // Generate current ETag
-    const currentETag = generateETag(timeframe);
+    // Get sessions from SQLite filtered by timeframe
+    const timeframMs =
+      TIMEFRAME_MS[timeframe] === Infinity ? null : TIMEFRAME_MS[timeframe];
+
+    const sessionsRaw = getSessions({ timeframMs, limit: 1000 });
+
+    // Get total count (without timeframe filter)
+    const allSessions = getSessions({ limit: 10000 });
+    const totalCount = allSessions.length;
+
+    // Generate stable ETag based on session count and the minute (changes at most once/minute)
+    // This prevents constant 200 responses during active conversations
+    const minuteTimestamp = Math.floor(Date.now() / 60000);
+    const hash = crypto.createHash("md5");
+    hash.update(
+      `${sessionsRaw.length}-${totalCount}-${minuteTimestamp}-${timeframe}`,
+    );
+    const currentETag = `"${hash.digest("hex")}"`;
 
     // Check If-None-Match header for conditional request
     const clientETag = req.headers["if-none-match"];
@@ -62,14 +75,26 @@ router.get("/list", async (req, res) => {
       return res.status(304).end();
     }
 
-    // Get sessions filtered by timeframe
-    const { sessions, totalCount, filteredCount } =
-      getSessionsByTimeframe(timeframe);
-    const cacheMeta = getCacheMeta();
+    // Transform sessions to match expected format
+    const sessions = sessionsRaw.map((s) => ({
+      id: s.id,
+      summary: s.summary || "New Session",
+      lastActivity: s.lastActivity
+        ? new Date(s.lastActivity).toISOString()
+        : null,
+      messageCount: s.messageCount || 0,
+      provider: s.provider || "claude",
+      cwd: s.cwd,
+      project: {
+        name: s.projectName,
+        displayName: s.projectDisplayName || s.projectName,
+        fullPath: s.projectFullPath,
+      },
+    }));
 
-    // Set caching headers
+    // Set caching headers (Cloudflare-friendly)
     res.set({
-      "Cache-Control": "private, max-age=10",
+      "Cache-Control": "public, max-age=10, stale-while-revalidate=5",
       ETag: currentETag,
     });
 
@@ -78,9 +103,9 @@ router.get("/list", async (req, res) => {
       sessions,
       meta: {
         totalCount,
-        filteredCount,
+        filteredCount: sessions.length,
         timeframe,
-        cacheTimestamp: cacheMeta.timestamp,
+        cacheTimestamp: new Date().toISOString(),
       },
     });
   } catch (error) {
@@ -98,10 +123,11 @@ router.get("/list", async (req, res) => {
  */
 router.get("/cache-status", (req, res) => {
   try {
-    const meta = getCacheMeta();
+    const count = getSessionCount();
     res.json({
-      initialized: isCacheInitialized(),
-      ...meta,
+      initialized: true,
+      sessionCount: count,
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

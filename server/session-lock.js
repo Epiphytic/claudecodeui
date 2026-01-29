@@ -239,15 +239,7 @@ class SessionLock {
 // Singleton instance
 const sessionLock = new SessionLock();
 
-// Periodic cleanup of stale locks (every 5 minutes)
-setInterval(
-  () => {
-    const cleaned = sessionLock.cleanupStaleLocks();
-    if (cleaned > 0) {
-      console.log(`[SessionLock] Cleaned up ${cleaned} stale locks`);
-    }
-  },
-  5 * 60 * 1000,
-);
+// Note: Periodic cleanup is now handled by maintenance-scheduler.js
+// The cleanup function is exported for registration with the scheduler
 
 export { SessionLock, sessionLock };

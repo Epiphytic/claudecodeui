@@ -1,6 +1,7 @@
 // hooks/useVersionCheck.js
 import { useState, useEffect } from "react";
 import { version } from "../../package.json";
+import { api } from "../utils/api";
 
 // Default npm package to check for updates
 // Can be overridden via VITE_NPM_PACKAGE environment variable
@@ -8,14 +9,18 @@ const DEFAULT_NPM_PACKAGE = "@epiphytic/claudecodeui";
 
 /**
  * Hook to check for version updates from npm registry
+ * Only checks for updates when:
+ * - Running from npm/npx (not in a git repo), OR
+ * - In a git repo on the main/master branch
  *
  * @param {string} [packageName] - Optional override for the npm package name
- * @returns {Object} { updateAvailable, latestVersion, currentVersion, packageInfo }
+ * @returns {Object} { updateAvailable, latestVersion, currentVersion, packageInfo, environmentInfo }
  */
 export const useVersionCheck = (packageName = null) => {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState(null);
   const [packageInfo, setPackageInfo] = useState(null);
+  const [environmentInfo, setEnvironmentInfo] = useState(null);
 
   // Determine which package to check
   // Priority: 1. Passed parameter, 2. Environment variable, 3. Default
@@ -25,6 +30,24 @@ export const useVersionCheck = (packageName = null) => {
   useEffect(() => {
     const checkVersion = async () => {
       try {
+        // First check if we should even check for updates
+        const envResponse = await api.environment();
+        if (envResponse.ok) {
+          const envData = await envResponse.json();
+          setEnvironmentInfo(envData);
+
+          // Skip version check if on a non-main branch in a git repo
+          if (!envData.shouldCheckForUpdates) {
+            console.log(
+              `Version check skipped: on branch '${envData.gitBranch}' (not main/master)`,
+            );
+            setUpdateAvailable(false);
+            setLatestVersion(null);
+            setPackageInfo(null);
+            return;
+          }
+        }
+
         // Encode package name for URL (handles scoped packages like @org/name)
         const encodedPackage = encodeURIComponent(npmPackage);
 
@@ -83,6 +106,7 @@ export const useVersionCheck = (packageName = null) => {
     latestVersion,
     currentVersion: version,
     packageInfo,
+    environmentInfo,
   };
 };
 

@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
-import { api } from '../utils/api';
+import React, { createContext, useContext, useEffect, useState } from "react";
+import { api } from "../utils/api";
 
 const AuthContext = createContext({
   user: null,
@@ -11,31 +11,34 @@ const AuthContext = createContext({
   needsSetup: false,
   hasCompletedOnboarding: true,
   refreshOnboardingStatus: () => {},
-  error: null
+  error: null,
 });
 
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
+    throw new Error("useAuth must be used within an AuthProvider");
   }
   return context;
 };
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
-  const [token, setToken] = useState(localStorage.getItem('auth-token'));
+  const [token, setToken] = useState(localStorage.getItem("auth-token"));
   const [isLoading, setIsLoading] = useState(true);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [hasCompletedOnboarding, setHasCompletedOnboarding] = useState(true);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    if (import.meta.env.VITE_IS_PLATFORM === 'true') {
-      setUser({ username: 'platform-user' });
-      setNeedsSetup(false);
-      checkOnboardingStatus();
-      setIsLoading(false);
+    if (import.meta.env.VITE_IS_PLATFORM === "true") {
+      const initPlatformMode = async () => {
+        setUser({ username: "platform-user" });
+        setNeedsSetup(false);
+        await checkOnboardingStatus();
+        setIsLoading(false);
+      };
+      initPlatformMode();
       return;
     }
 
@@ -50,7 +53,7 @@ export const AuthProvider = ({ children }) => {
         setHasCompletedOnboarding(data.hasCompletedOnboarding);
       }
     } catch (error) {
-      console.error('Error checking onboarding status:', error);
+      console.error("Error checking onboarding status:", error);
       setHasCompletedOnboarding(true);
     }
   };
@@ -86,20 +89,20 @@ export const AuthProvider = ({ children }) => {
             await checkOnboardingStatus();
           } else {
             // Token is invalid
-            localStorage.removeItem('auth-token');
+            localStorage.removeItem("auth-token");
             setToken(null);
             setUser(null);
           }
         } catch (error) {
-          console.error('Token verification failed:', error);
-          localStorage.removeItem('auth-token');
+          console.error("Token verification failed:", error);
+          localStorage.removeItem("auth-token");
           setToken(null);
           setUser(null);
         }
       }
     } catch (error) {
-      console.error('[AuthContext] Auth status check failed:', error);
-      setError('Failed to check authentication status');
+      console.error("[AuthContext] Auth status check failed:", error);
+      setError("Failed to check authentication status");
     } finally {
       setIsLoading(false);
     }
@@ -115,15 +118,15 @@ export const AuthProvider = ({ children }) => {
       if (response.ok) {
         setToken(data.token);
         setUser(data.user);
-        localStorage.setItem('auth-token', data.token);
+        localStorage.setItem("auth-token", data.token);
         return { success: true };
       } else {
-        setError(data.error || 'Login failed');
-        return { success: false, error: data.error || 'Login failed' };
+        setError(data.error || "Login failed");
+        return { success: false, error: data.error || "Login failed" };
       }
     } catch (error) {
-      console.error('Login error:', error);
-      const errorMessage = 'Network error. Please try again.';
+      console.error("Login error:", error);
+      const errorMessage = "Network error. Please try again.";
       setError(errorMessage);
       return { success: false, error: errorMessage };
     }
@@ -140,15 +143,15 @@ export const AuthProvider = ({ children }) => {
         setToken(data.token);
         setUser(data.user);
         setNeedsSetup(false);
-        localStorage.setItem('auth-token', data.token);
+        localStorage.setItem("auth-token", data.token);
         return { success: true };
       } else {
-        setError(data.error || 'Registration failed');
-        return { success: false, error: data.error || 'Registration failed' };
+        setError(data.error || "Registration failed");
+        return { success: false, error: data.error || "Registration failed" };
       }
     } catch (error) {
-      console.error('Registration error:', error);
-      const errorMessage = 'Network error. Please try again.';
+      console.error("Registration error:", error);
+      const errorMessage = "Network error. Please try again.";
       setError(errorMessage);
       return { success: false, error: errorMessage };
     }
@@ -157,12 +160,12 @@ export const AuthProvider = ({ children }) => {
   const logout = () => {
     setToken(null);
     setUser(null);
-    localStorage.removeItem('auth-token');
-    
+    localStorage.removeItem("auth-token");
+
     // Optional: Call logout endpoint for logging
     if (token) {
-      api.auth.logout().catch(error => {
-        console.error('Logout endpoint error:', error);
+      api.auth.logout().catch((error) => {
+        console.error("Logout endpoint error:", error);
       });
     }
   };
@@ -177,12 +180,8 @@ export const AuthProvider = ({ children }) => {
     needsSetup,
     hasCompletedOnboarding,
     refreshOnboardingStatus,
-    error
+    error,
   };
 
-  return (
-    <AuthContext.Provider value={value}>
-      {children}
-    </AuthContext.Provider>
-  );
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };

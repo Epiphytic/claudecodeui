@@ -86,6 +86,12 @@ import {
   resizeSession as resizeTmuxSession,
 } from "./tmux-manager.js";
 import { detectExternalClaude } from "./external-session-detector.js";
+import { createLogger } from "./logger.js";
+import {
+  startCacheUpdater,
+  setProcessCacheActive,
+  CACHE_UPDATE_INTERVAL,
+} from "./process-cache.js";
 import {
   spawnCursor,
   abortCursorSession,
@@ -97,7 +103,12 @@ import {
   abortCodexSession,
   isCodexSessionActive,
   getActiveCodexSessions,
+  cleanupCodexSessions,
 } from "./openai-codex.js";
+import {
+  registerTask,
+  setActive as setMaintenanceActive,
+} from "./maintenance-scheduler.js";
 import gitRoutes from "./routes/git.js";
 import authRoutes from "./routes/auth.js";
 import mcpRoutes from "./routes/mcp.js";
@@ -112,15 +123,36 @@ import cliAuthRoutes from "./routes/cli-auth.js";
 import userRoutes from "./routes/user.js";
 import codexRoutes from "./routes/codex.js";
 import sessionsRoutes from "./routes/sessions.js";
-import { updateSessionsCache } from "./sessions-cache.js";
+import { updateSessionsCache, updateSessionTitle } from "./sessions-cache.js";
+import {
+  getSessionTitleFromHistory,
+  invalidateCache as invalidateHistoryCache,
+} from "./history-cache.js";
+import {
+  getMessageList,
+  getMessageByNumber,
+  getMessagesByRange,
+  LIST_CACHE_TTL,
+  MESSAGE_CACHE_TTL,
+} from "./messages-cache.js";
 import { updateProjectsCache } from "./projects-cache.js";
 import { initializeDatabase, tmuxSessionsDb } from "./database/db.js";
+import {
+  getDatabase,
+  getProjectsFromDb,
+  getSessions as getSessionsFromDb,
+  getVersion,
+} from "./database.js";
+import { indexFile, indexAllProjects } from "./db-indexer.js";
 import {
   validateApiKey,
   authenticateToken,
   authenticateWebSocket,
 } from "./middleware/auth.js";
 import { initializeOrchestrator, StatusValues } from "./orchestrator/index.js";
+
+// Initialize logger for main server
+const log = createLogger("server");
 
 // File system watcher for projects folder
 let projectsWatcher = null;
@@ -185,10 +217,11 @@ async function setupProjectsWatcher() {
       persistent: true,
       ignoreInitial: true, // Don't fire events for existing files on startup
       followSymlinks: false,
-      depth: 10, // Reasonable depth limit
+      usePolling: false,
+      depth: 2, // Reduced depth limit for performance
       awaitWriteFinish: {
-        stabilityThreshold: 100, // Wait 100ms for file to stabilize
-        pollInterval: 50,
+        stabilityThreshold: 500, // Wait 500ms for file to stabilize
+        pollInterval: 200,
       },
     });
 
@@ -201,12 +234,18 @@ async function setupProjectsWatcher() {
           // Clear project directory cache when files change
           clearProjectDirectoryCache();
 
-          // Get updated projects list
-          const updatedProjects = await getProjects();
+          // Use SQLite incremental indexing instead of full re-parse
+          // This only processes new bytes in the changed file
+          const indexResult = await indexFile(filePath);
+          log.debug({ filePath, indexResult }, "File indexed");
 
-          // Update sessions and projects caches with new projects data
-          updateSessionsCache(updatedProjects);
-          updateProjectsCache(updatedProjects);
+          // Get lightweight data from SQLite for client notification
+          // This is much cheaper than parsing all JSONL files
+          const projectsFromDb = getProjectsFromDb();
+
+          // Update in-memory caches from SQLite (for backward compatibility)
+          // TODO: Eventually remove these caches entirely
+          updateProjectsCache(projectsFromDb);
 
           // Clean up stale tmux session entries from database
           cleanupStaleTmuxSessions();
@@ -214,7 +253,7 @@ async function setupProjectsWatcher() {
           // Notify all connected clients about the project changes
           const updateMessage = JSON.stringify({
             type: "projects_updated",
-            projects: updatedProjects,
+            projects: projectsFromDb,
             timestamp: new Date().toISOString(),
             changeType: eventType,
             changedFile: path.relative(claudeProjectsPath, filePath),
@@ -228,7 +267,7 @@ async function setupProjectsWatcher() {
         } catch (error) {
           console.error("[ERROR] Error handling project changes:", error);
         }
-      }, 300); // 300ms debounce (slightly faster than before)
+      }, 2000); // 2 second debounce to reduce UI refresh frequency
     };
 
     // Set up event listeners
@@ -522,6 +561,64 @@ app.use("/api", validateApiKey);
 // Authentication routes (public)
 app.use("/api/auth", authRoutes);
 
+// Environment info endpoint (public) - used by version checker
+app.get("/api/environment", async (req, res) => {
+  try {
+    const { execSync } = await import("child_process");
+    const serverDir = __dirname;
+
+    let isGitRepo = false;
+    let gitBranch = null;
+    let shouldCheckForUpdates = true;
+
+    // Check if server directory is a git repo
+    try {
+      execSync("git rev-parse --is-inside-work-tree", {
+        cwd: serverDir,
+        stdio: "pipe",
+      });
+      isGitRepo = true;
+
+      // Get current branch
+      const branchOutput = execSync("git rev-parse --abbrev-ref HEAD", {
+        cwd: serverDir,
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      gitBranch = branchOutput.trim();
+
+      // Only check for updates if on main/master branch
+      shouldCheckForUpdates = gitBranch === "main" || gitBranch === "master";
+    } catch {
+      // Not a git repo or git not available
+      // Likely running from npm/npx - should check for updates
+      shouldCheckForUpdates = true;
+    }
+
+    // Detect if running from npx (temporary directory)
+    const isNpx =
+      process.argv[1]?.includes("_npx") ||
+      process.argv[1]?.includes("npx-") ||
+      process.env.npm_execpath?.includes("npx");
+
+    res.json({
+      isGitRepo,
+      gitBranch,
+      shouldCheckForUpdates,
+      isNpx: isNpx || false,
+    });
+  } catch (error) {
+    console.error("Environment check error:", error);
+    // Default to checking for updates on error
+    res.json({
+      isGitRepo: false,
+      gitBranch: null,
+      shouldCheckForUpdates: true,
+      isNpx: false,
+    });
+  }
+});
+
 // Projects API Routes (protected)
 app.use("/api/projects", authenticateToken, projectsRoutes);
 
@@ -568,13 +665,9 @@ app.use(
     etag: true,
     lastModified: true,
     setHeaders: (res, filePath) => {
-      // Cache icons and other static assets
+      // Cache icons and other static assets for 1 hour
       if (filePath.match(/\.(svg|png|jpg|jpeg|gif|ico|woff2?|ttf|eot)$/)) {
-        // Cache for 1 week, allow revalidation
-        res.setHeader(
-          "Cache-Control",
-          "public, max-age=604800, must-revalidate",
-        );
+        res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
       } else if (filePath.endsWith(".json")) {
         // JSON files (like manifest.json) - short cache with revalidation
         res.setHeader("Cache-Control", "public, max-age=3600, must-revalidate");
@@ -685,8 +778,58 @@ app.post("/api/system/update", authenticateToken, async (req, res) => {
 app.get("/api/projects", authenticateToken, async (req, res) => {
   try {
     const projects = await getProjects();
+
+    // Set cache headers - 5 min cache with revalidation (public for Cloudflare)
+    const version = getVersion("projects");
+    res.set({
+      "Cache-Control": "public, max-age=300, stale-while-revalidate=60",
+      ETag: `"projects-${version.version}"`,
+    });
+
     res.json(projects);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// External Claude session detection endpoint
+// Returns cached process data, refreshed every 60 seconds
+// Cacheable by clients for up to 60 seconds
+app.get("/api/external-sessions", authenticateToken, async (req, res) => {
+  try {
+    const { projectPath } = req.query;
+
+    // Set cache headers - clients can cache for up to 60 seconds
+    res.setHeader("Cache-Control", "private, max-age=60");
+
+    const result = detectExternalClaude(projectPath || null);
+
+    log.debug(
+      {
+        projectPath,
+        hasExternalSession: result.hasExternalSession,
+        processCount: result.processes.length,
+        cacheAge: result.cacheAge,
+      },
+      "External session check",
+    );
+
+    res.json({
+      hasExternalSession: result.hasExternalSession,
+      detectionAvailable: result.detectionAvailable,
+      detectionError: result.detectionError,
+      cacheAge: result.cacheAge,
+      details: result.hasExternalSession
+        ? {
+            processIds: result.processes.map((p) => p.pid),
+            commands: result.processes.map((p) => p.command),
+            tmuxSessions: result.tmuxSessions.map((s) => s.sessionName),
+            lockFile: result.lockFile.exists ? result.lockFile.lockFile : null,
+          }
+        : null,
+    });
+  } catch (error) {
+    log.error({ error: error.message }, "External session check failed");
     res.status(500).json({ error: error.message });
   }
 });
@@ -764,6 +907,130 @@ app.get(
   },
 );
 
+// NEW: Get message list (IDs and numbers only) - cached for 60 seconds
+// This is the efficient way to check for new messages
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/list",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId } = req.params;
+
+      const result = await getMessageList(projectName, sessionId);
+
+      // Generate ETag based on total count and cache timestamp
+      const currentETag = `"list-${sessionId}-${result.total}-${result.cachedAt}"`;
+
+      // Check If-None-Match header
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers - 60 second cache (public for Cloudflare)
+      res.set({
+        "Cache-Control": `public, max-age=${Math.floor(LIST_CACHE_TTL / 1000)}, stale-while-revalidate=30`,
+        ETag: currentETag,
+      });
+
+      res.json(result);
+    } catch (error) {
+      console.error("[MessagesListEndpoint] Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// NEW: Get a single message by number (1-indexed) - cached for 30 minutes
+// Messages are immutable, so they can be cached for a long time
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/number/:messageNumber",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId, messageNumber } = req.params;
+      const num = parseInt(messageNumber, 10);
+
+      if (isNaN(num) || num < 1) {
+        return res.status(400).json({ error: "Invalid message number" });
+      }
+
+      const message = await getMessageByNumber(projectName, sessionId, num);
+
+      if (!message) {
+        return res.status(404).json({ error: "Message not found" });
+      }
+
+      // Generate ETag based on message ID and timestamp
+      const msgId = message.uuid || message.id || `msg_${num}`;
+      const currentETag = `"msg-${sessionId}-${num}-${msgId}"`;
+
+      // Check If-None-Match header
+      const clientETag = req.headers["if-none-match"];
+      if (clientETag && clientETag === currentETag) {
+        return res.status(304).end();
+      }
+
+      // Set caching headers - 30 minute cache (messages are immutable, public for Cloudflare)
+      res.set({
+        "Cache-Control": `public, max-age=${Math.floor(MESSAGE_CACHE_TTL / 1000)}, immutable`,
+        ETag: currentETag,
+      });
+
+      res.json({ number: num, message });
+    } catch (error) {
+      console.error("[MessageByNumberEndpoint] Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
+// NEW: Get messages by number range - for batch fetching
+app.get(
+  "/api/projects/:projectName/sessions/:sessionId/messages/range/:start/:end",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { projectName, sessionId, start, end } = req.params;
+      const startNum = parseInt(start, 10);
+      const endNum = parseInt(end, 10);
+
+      if (
+        isNaN(startNum) ||
+        isNaN(endNum) ||
+        startNum < 1 ||
+        endNum < startNum
+      ) {
+        return res.status(400).json({ error: "Invalid range" });
+      }
+
+      // Limit range to prevent abuse
+      if (endNum - startNum > 100) {
+        return res
+          .status(400)
+          .json({ error: "Range too large (max 100 messages)" });
+      }
+
+      const messages = await getMessagesByRange(
+        projectName,
+        sessionId,
+        startNum,
+        endNum,
+      );
+
+      // Set cache - range queries for initial load (public for Cloudflare)
+      res.set({
+        "Cache-Control": "public, max-age=60, stale-while-revalidate=30",
+      });
+
+      res.json({ messages, start: startNum, end: endNum });
+    } catch (error) {
+      console.error("[MessageRangeEndpoint] Error:", error.message);
+      res.status(500).json({ error: error.message });
+    }
+  },
+);
+
 // Rename project endpoint
 app.put(
   "/api/projects/:projectName/rename",
@@ -778,6 +1045,42 @@ app.put(
     }
   },
 );
+
+// Avatar proxy endpoint - serves GitHub avatars with aggressive caching for Cloudflare
+app.get("/api/avatar/:githubId", authenticateToken, async (req, res) => {
+  try {
+    const { githubId } = req.params;
+    const size = req.query.s || "80";
+
+    // Validate githubId (should be numeric)
+    if (!/^\d+$/.test(githubId)) {
+      return res.status(400).json({ error: "Invalid GitHub ID" });
+    }
+
+    // Fetch from GitHub
+    const githubUrl = `https://avatars.githubusercontent.com/u/${githubId}?s=${size}&v=4`;
+    const response = await fetch(githubUrl);
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Avatar not found" });
+    }
+
+    // Set cache headers for aggressive caching (1 year, public for Cloudflare)
+    res.set({
+      "Content-Type": response.headers.get("content-type") || "image/png",
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "CDN-Cache-Control": "public, max-age=31536000",
+      "Cloudflare-CDN-Cache-Control": "public, max-age=31536000",
+    });
+
+    // Pipe the avatar to the response
+    const buffer = await response.arrayBuffer();
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    console.error("[AvatarProxy] Error:", error.message);
+    res.status(500).json({ error: "Failed to fetch avatar" });
+  }
+});
 
 // Delete session endpoint
 app.delete(
@@ -1231,6 +1534,10 @@ function handleChatConnection(ws) {
 
   // Add to connected clients for project updates
   connectedClients.add(ws);
+  // Activate process cache and maintenance scheduler when clients are connected
+  const hasClients = connectedClients.size > 0;
+  setProcessCacheActive(hasClients);
+  setMaintenanceActive(hasClients);
 
   // Generate unique connection ID for orchestrator status tracking
   const connectionId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -1252,6 +1559,10 @@ function handleChatConnection(ws) {
     console.log("🔌 Chat client disconnected");
     // Remove from connected clients
     connectedClients.delete(ws);
+    // Update process cache and maintenance scheduler based on remaining clients
+    const hasClients = connectedClients.size > 0;
+    setProcessCacheActive(hasClients);
+    setMaintenanceActive(hasClients);
     // Track disconnection for orchestrator status (if enabled)
     if (orchestratorStatusHooks) {
       orchestratorStatusHooks.onConnectionClose(connectionId);
@@ -1270,26 +1581,28 @@ async function handleChatMessage(ws, writer, messageData) {
     // Handle proactive external session check (before user submits a prompt)
     if (data.type === "check-external-session") {
       const projectPath = data.projectPath;
-      console.log(
-        "[ExternalSessionCheck] Checking for external sessions:",
-        projectPath,
-      );
+      log.debug({ projectPath }, "External session check requested");
       if (projectPath) {
         const externalCheck = detectExternalClaude(projectPath);
-        console.log("[ExternalSessionCheck] Result:", {
-          hasExternalSession: externalCheck.hasExternalSession,
-          detectionAvailable: externalCheck.detectionAvailable,
-          detectionError: externalCheck.detectionError,
-          processCount: externalCheck.processes.length,
-          tmuxCount: externalCheck.tmuxSessions.length,
-          hasLockFile: externalCheck.lockFile.exists,
-        });
+        log.debug(
+          {
+            projectPath,
+            hasExternalSession: externalCheck.hasExternalSession,
+            detectionAvailable: externalCheck.detectionAvailable,
+            detectionError: externalCheck.detectionError,
+            processCount: externalCheck.processes.length,
+            tmuxCount: externalCheck.tmuxSessions.length,
+            hasLockFile: externalCheck.lockFile.exists,
+          },
+          "External session check result",
+        );
         writer.send({
           type: "external-session-check-result",
           projectPath,
           hasExternalSession: externalCheck.hasExternalSession,
           detectionAvailable: externalCheck.detectionAvailable,
           detectionError: externalCheck.detectionError,
+          cacheAge: externalCheck.cacheAge,
           details: externalCheck.hasExternalSession
             ? {
                 processIds: externalCheck.processes.map((p) => p.pid),
@@ -1304,15 +1617,22 @@ async function handleChatMessage(ws, writer, messageData) {
             : null,
         });
       } else {
-        console.log("[ExternalSessionCheck] No projectPath provided");
+        log.debug("External session check: no projectPath provided");
       }
       return;
     }
 
     if (data.type === "claude-command") {
-      console.log("[DEBUG] User message:", data.command || "[Continue/Resume]");
-      console.log("📁 Project:", data.options?.projectPath || "Unknown");
-      console.log("🔄 Session:", data.options?.sessionId ? "Resume" : "New");
+      log.debug(
+        {
+          command: data.command
+            ? data.command.slice(0, 50)
+            : "[Continue/Resume]",
+          project: data.options?.projectPath || "Unknown",
+          sessionMode: data.options?.sessionId ? "Resume" : "New",
+        },
+        "User message received",
+      );
 
       const projectPath = data.options?.projectPath;
       const sessionId = data.options?.sessionId || sessionIdForTracking;
@@ -1341,10 +1661,19 @@ async function handleChatMessage(ws, writer, messageData) {
       if (projectPath) {
         const externalCheck = detectExternalClaude(projectPath);
         if (externalCheck.hasExternalSession) {
+          log.info(
+            {
+              projectPath,
+              processCount: externalCheck.processes.length,
+              tmuxCount: externalCheck.tmuxSessions.length,
+            },
+            "External Claude session detected during chat",
+          );
           writer.send({
             type: "external-session-detected",
             projectPath,
             detectionAvailable: externalCheck.detectionAvailable,
+            cacheAge: externalCheck.cacheAge,
             details: {
               processIds: externalCheck.processes.map((p) => p.pid),
               tmuxSessions: externalCheck.tmuxSessions.map(
@@ -1412,6 +1741,27 @@ async function handleChatMessage(ws, writer, messageData) {
         // Mark as no longer busy
         if (orchestratorStatusHooks) {
           orchestratorStatusHooks.onQueryEnd(sessionIdForTracking);
+        }
+
+        // Update session title from history.jsonl (last user prompt)
+        try {
+          // Invalidate history cache to get fresh data
+          invalidateHistoryCache();
+          const newTitle = await getSessionTitleFromHistory(sessionId);
+          if (newTitle) {
+            const updated = updateSessionTitle(sessionId, newTitle);
+            if (updated) {
+              log.debug(
+                { sessionId, title: newTitle.slice(0, 50) },
+                "Updated session title from history",
+              );
+            }
+          }
+        } catch (titleError) {
+          log.debug(
+            { sessionId, error: titleError.message },
+            "Failed to update session title",
+          );
         }
       }
     } else if (data.type === "cursor-command") {
@@ -2997,28 +3347,87 @@ async function startServer() {
       );
       console.log("");
 
-      // Start watching the projects folder for changes
-      await setupProjectsWatcher();
-
-      // Initialize sessions and projects caches with initial project data
+      // Initialize SQLite database and index all projects
+      // NOTE: This must happen BEFORE starting the file watcher to avoid contention
       try {
-        const initialProjects = await getProjects();
-        updateSessionsCache(initialProjects);
-        updateProjectsCache(initialProjects);
-        console.log(
-          `${c.ok("[OK]")} Sessions cache initialized with ${initialProjects.length} projects`,
-        );
-        console.log(
-          `${c.ok("[OK]")} Projects cache initialized with ${initialProjects.length} projects`,
-        );
+        console.log(`${c.info("[INFO]")} Initializing SQLite database...`);
 
-        // Clean up stale tmux session entries on startup
-        cleanupStaleTmuxSessions();
+        // Initialize SQLite database connection
+        getDatabase();
+
+        // Run full indexing of all projects
+        // This is incremental - only processes changed/new files
+        const indexResult = await indexAllProjects();
+
+        if (indexResult.success) {
+          console.log(
+            `${c.ok("[OK]")} SQLite database indexed: ${indexResult.stats.projects} projects, ${indexResult.stats.sessions} sessions`,
+          );
+        } else {
+          console.warn(
+            `${c.warn("[WARN]")} Indexing incomplete: ${indexResult.error}`,
+          );
+        }
+
+        // Populate in-memory caches from SQLite (for backward compatibility)
+        // TODO: Eventually remove these caches and read directly from SQLite
+        const projectsFromDb = getProjectsFromDb();
+        updateProjectsCache(projectsFromDb);
+
+        console.log(
+          `${c.ok("[OK]")} Caches initialized from SQLite with ${projectsFromDb.length} projects`,
+        );
       } catch (cacheError) {
         console.warn(
-          `${c.warn("[WARN]")} Failed to initialize caches: ${cacheError.message}`,
+          `${c.warn("[WARN]")} Failed to initialize database: ${cacheError.message}`,
         );
+        // Fall back to legacy getProjects if SQLite fails
+        try {
+          const initialProjects = await getProjects();
+          updateSessionsCache(initialProjects);
+          updateProjectsCache(initialProjects);
+          console.log(
+            `${c.ok("[OK]")} Caches initialized (legacy) with ${initialProjects.length} projects`,
+          );
+        } catch (fallbackError) {
+          console.error(
+            `${c.warn("[ERROR]")} Cache initialization failed completely`,
+          );
+        }
       }
+
+      // Start watching the projects folder for changes (after cache is initialized)
+      await setupProjectsWatcher();
+
+      // Clean up stale tmux session entries on startup
+      cleanupStaleTmuxSessions();
+
+      // Start the process cache updater for external session detection
+      startCacheUpdater();
+      console.log(
+        `${c.ok("[OK]")} Process cache started (updates every ${CACHE_UPDATE_INTERVAL / 1000}s)`,
+      );
+
+      // Register maintenance tasks with centralized scheduler
+      // These tasks only run when WebSocket clients are connected
+      registerTask(
+        "session-lock-cleanup",
+        () => {
+          const cleaned = sessionLock.cleanupStaleLocks();
+          if (cleaned > 0) {
+            console.log(`[SessionLock] Cleaned up ${cleaned} stale locks`);
+          }
+        },
+        5 * 60 * 1000, // 5 minutes
+      );
+      registerTask(
+        "codex-session-cleanup",
+        cleanupCodexSessions,
+        5 * 60 * 1000,
+      );
+      console.log(
+        `${c.ok("[OK]")} Maintenance scheduler initialized (idle detection enabled)`,
+      );
     });
   } catch (error) {
     console.error("[ERROR] Failed to start server:", error);
