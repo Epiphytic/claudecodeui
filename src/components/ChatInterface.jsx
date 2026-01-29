@@ -735,6 +735,12 @@ const MessageComponent = memo(
                   <div className="w-8 h-8 bg-gray-600 dark:bg-gray-700 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0">
                     🔧
                   </div>
+                ) : message.type === "system" ? (
+                  <div className="w-8 h-8 bg-gray-500 dark:bg-gray-600 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
                 ) : (
                   <div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm flex-shrink-0 p-1">
                     {(localStorage.getItem("selected-provider") || "claude") ===
@@ -753,13 +759,15 @@ const MessageComponent = memo(
                     ? "Error"
                     : message.type === "tool"
                       ? "Tool"
-                      : (localStorage.getItem("selected-provider") ||
-                            "claude") === "cursor"
-                        ? "Cursor"
+                      : message.type === "system"
+                        ? "System"
                         : (localStorage.getItem("selected-provider") ||
-                              "claude") === "codex"
-                          ? "Codex"
-                          : "Claude"}
+                              "claude") === "cursor"
+                          ? "Cursor"
+                          : (localStorage.getItem("selected-provider") ||
+                                "claude") === "codex"
+                            ? "Codex"
+                            : "Claude"}
                 </div>
               </div>
             )}
@@ -4150,7 +4158,8 @@ function ChatInterface({
             displayContent = unescapeWithMathProtection(displayContent);
           }
           converted.push({
-            type: messageType,
+            // Task notifications should appear as system messages, not user messages
+            type: taskNotification ? "system" : messageType,
             content: taskNotification
               ? taskNotification.summary
               : displayContent,
@@ -7340,48 +7349,6 @@ function ChatInterface({
         `}
       </style>
       <div className="h-full flex flex-col">
-        {/* External Session Warning Banner */}
-        {externalSessionWarning && (
-          <div className="flex-shrink-0 bg-orange-50 dark:bg-orange-900/20 border-b border-orange-200 dark:border-orange-800 px-4 py-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-orange-700 dark:text-orange-400 text-sm">
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                  />
-                </svg>
-                <span>External Claude session detected on this project</span>
-              </div>
-              <button
-                onClick={() => setExternalSessionWarning(null)}
-                className="text-orange-500 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300"
-              >
-                <svg
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M6 18L18 6M6 6l12 12"
-                  />
-                </svg>
-              </button>
-            </div>
-          </div>
-        )}
-
         {/* Messages Area - Scrollable Middle Section */}
         <div
           ref={scrollContainerRef}
@@ -8122,6 +8089,48 @@ function ChatInterface({
             </div>
           </div>
 
+          {/* External Session Warning - Above Chat Input */}
+          {externalSessionWarning && (
+            <div className="max-w-4xl mx-auto mb-2 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg px-4 py-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-orange-700 dark:text-orange-400 text-sm">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                    />
+                  </svg>
+                  <span>External Claude session detected — use Fork to start a new session</span>
+                </div>
+                <button
+                  onClick={() => setExternalSessionWarning(null)}
+                  className="text-orange-500 hover:text-orange-700 dark:text-orange-400 dark:hover:text-orange-300"
+                >
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M6 18L18 6M6 6l12 12"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          )}
+
           <form onSubmit={handleSubmit} className="relative max-w-4xl mx-auto">
             {/* Drag overlay */}
             {isDragActive && (
@@ -8293,7 +8302,7 @@ function ChatInterface({
                 />
               </div>
 
-              {/* Fork button - starts a new session */}
+              {/* Fork button - starts a new session (Git-style fork icon) */}
               <button
                 type="button"
                 disabled={!input.trim() || isLoading}
@@ -8306,35 +8315,41 @@ function ChatInterface({
                   handleFork(e);
                 }}
                 title="Fork: Start new session with this prompt"
-                className="absolute right-16 top-1/2 transform -translate-y-1/2 w-10 h-10 sm:w-10 sm:h-10 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 dark:ring-offset-gray-800"
+                className="absolute right-16 top-1/2 transform -translate-y-1/2 w-10 h-10 sm:w-10 sm:h-10 bg-[#F05032] hover:bg-[#D84528] disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-[#F05032] focus:ring-offset-2 dark:ring-offset-gray-800"
               >
+                {/* Git-style fork/branch icon */}
                 <svg
-                  className="w-4 h-4 sm:w-5 sm:h-5 text-white"
-                  fill="none"
-                  stroke="currentColor"
+                  className="w-5 h-5 sm:w-5 sm:h-5 text-white"
                   viewBox="0 0 24 24"
+                  fill="currentColor"
                 >
+                  {/* Git branch icon - two branches merging */}
+                  <circle cx="7" cy="5" r="2.5" />
+                  <circle cx="17" cy="5" r="2.5" />
+                  <circle cx="12" cy="19" r="2.5" />
                   <path
+                    d="M7 7.5V11c0 1.5 1 3 5 5.5M17 7.5V11c0 1.5-1 3-5 5.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
                     strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"
                   />
                 </svg>
               </button>
 
-              {/* Send button */}
+              {/* Send button - disabled when external session detected */}
               <button
                 type="submit"
-                disabled={!input.trim() || isLoading}
+                disabled={!input.trim() || isLoading || !!externalSessionWarning}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  handleSubmit(e);
+                  if (!externalSessionWarning) handleSubmit(e);
                 }}
                 onTouchStart={(e) => {
                   e.preventDefault();
-                  handleSubmit(e);
+                  if (!externalSessionWarning) handleSubmit(e);
                 }}
+                title={externalSessionWarning ? "External session detected — use Fork instead" : "Send message"}
                 className="absolute right-2 top-1/2 transform -translate-y-1/2 w-12 h-12 sm:w-12 sm:h-12 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800"
               >
                 <svg
