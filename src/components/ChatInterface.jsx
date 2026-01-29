@@ -4069,6 +4069,13 @@ function ChatInterface({
   const convertSessionMessages = (rawMessages) => {
     const converted = [];
     const toolResults = new Map(); // Map tool_use_id to tool result
+    let messageIndex = 0; // Counter for generating stable IDs
+
+    // Helper to generate stable ID based on timestamp and position
+    const generateStableId = (timestamp) => {
+      const ts = new Date(timestamp || Date.now()).getTime();
+      return `loaded-${ts}-${messageIndex++}`;
+    };
 
     // First pass: collect all tool results
     for (const msg of rawMessages) {
@@ -4158,6 +4165,7 @@ function ChatInterface({
             displayContent = unescapeWithMathProtection(displayContent);
           }
           converted.push({
+            id: generateStableId(msg.timestamp),
             // Task notifications should appear as system messages, not user messages
             type: taskNotification ? "system" : messageType,
             content: taskNotification
@@ -4174,6 +4182,7 @@ function ChatInterface({
       // Handle thinking messages (Codex reasoning)
       else if (msg.type === "thinking" && msg.message?.content) {
         converted.push({
+          id: generateStableId(msg.timestamp),
           type: "assistant",
           content: unescapeWithMathProtection(msg.message.content),
           timestamp: msg.timestamp || new Date().toISOString(),
@@ -4184,6 +4193,7 @@ function ChatInterface({
       // Handle tool_use messages (Codex function calls)
       else if (msg.type === "tool_use" && msg.toolName) {
         converted.push({
+          id: generateStableId(msg.timestamp),
           type: "assistant",
           content: "",
           timestamp: msg.timestamp || new Date().toISOString(),
@@ -4221,6 +4231,7 @@ function ChatInterface({
                 text = unescapeWithMathProtection(text);
               }
               converted.push({
+                id: generateStableId(msg.timestamp),
                 type: "assistant",
                 content: text,
                 timestamp: msg.timestamp || new Date().toISOString(),
@@ -4230,6 +4241,7 @@ function ChatInterface({
               const toolResult = toolResults.get(part.id);
 
               converted.push({
+                id: generateStableId(msg.timestamp),
                 type: "assistant",
                 content: "",
                 timestamp: msg.timestamp || new Date().toISOString(),
@@ -4256,6 +4268,7 @@ function ChatInterface({
           let text = msg.message.content;
           text = unescapeWithMathProtection(text);
           converted.push({
+            id: generateStableId(msg.timestamp),
             type: "assistant",
             content: text,
             timestamp: msg.timestamp || new Date().toISOString(),
