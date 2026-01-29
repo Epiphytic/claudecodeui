@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/Epiphytic/claudecodeui/compare/v1.2.3...v1.3.0) (2026-01-29)
+
+
+### Features
+
+* add cacheable messages list endpoint ([#5](https://github.com/Epiphytic/claudecodeui/issues/5)) ([96527db](https://github.com/Epiphytic/claudecodeui/commit/96527db7f422e535f1e8c75016092189d0ee5aa8))
+
 ## [1.2.3](https://github.com/Epiphytic/claudecodeui/compare/v1.2.2...v1.2.3) (2026-01-25)
 
 
